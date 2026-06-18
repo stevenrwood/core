@@ -90,8 +90,16 @@ static on_gcode_message_ptr on_gcode_comment;
 
 FLASHMEM static status_code_t read_command (char *line, uint_fast8_t *pos, ngc_cmd_t *operation)
 {
-    char c = line[*pos];
     status_code_t status = Status_OK;
+
+    // Skip any whitespace between the O<label> and the flow keyword. grblHAL keeps interior spaces
+    // (gc_normalize_block strips only leading whitespace), so "O<cal> CALL" reaches here with the gap
+    // intact and this read would otherwise land on the space -> default case -> "error:81 Unknown flow
+    // statement". Tolerating the gap makes O-word calls work whether or not the sender/file closes it up.
+    while(line[*pos] == ' ' || line[*pos] == '\t')
+        (*pos)++;
+
+    char c = line[*pos];
 
     (*pos)++;
 
