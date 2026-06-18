@@ -681,7 +681,13 @@ FLASHMEM status_code_t ngc_flowctrl (uint32_t o_label, line_number_t line_number
                         if((subname = ngc_string_param_get((ngc_string_id_t)o_label))) {
                             char filename[60];
                             vfs_file_t *file;
-#if LITTLEFS_ENABLE == 1
+#if LITTLEFS_ENABLE
+                            // Search /littlefs first, then root, whenever LittleFS is enabled (1 OR 2).
+                            // With LITTLEFS_ENABLE==2 and an SD card present, LittleFS is mounted at
+                            // /littlefs (root is the SD card), so O<name> CALL must look there too -
+                            // a "== 1" test missed that case and left the file-open to fail (then masked
+                            // as error:81 at the sub==NULL check below). The root fallback still covers
+                            // LITTLEFS_ENABLE==2 with no SD card, where LittleFS is mounted as root.
                             sprintf(filename, "/littlefs/%s.macro", subname);
 
                             if((file = stream_redirect_read(filename, onNamedSubError, onNamedSubEOF)) == NULL) {
