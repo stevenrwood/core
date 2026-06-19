@@ -673,7 +673,7 @@ FLASHMEM status_code_t ngc_flowctrl (uint32_t o_label, line_number_t line_number
                         if((subname = ngc_string_param_get((ngc_string_id_t)o_label))) {
                             char filename[60];
                             vfs_file_t *file;
-#if LITTLEFS_ENABLE == 1
+#if LITTLEFS_ENABLE
                             sprintf(filename, "/littlefs/%s.macro", subname);
 
                             if((file = stream_redirect_read(filename, onNamedSubError, onNamedSubEOF)) == NULL) {
