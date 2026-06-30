@@ -1030,6 +1030,10 @@ FLASHMEM void report_build_info (char *line, bool extended)
         strcat(buf, "EXPR,");
     #endif
 
+    #ifdef ROTATION_ENABLE
+        strcat(buf, "WCSROT,");   // coordinate-system rotation (G68/G69, G10 L2 R<deg>) is available
+    #endif
+
         if(atc != ATC_None || (settings.tool_change.mode != ToolChange_Ignore && !!hal.stream.suspend_read))
             strcat(buf, atc == ATC_None ? "TC," : (atc == ATC_Online ? "ATC=1," : "ATC=0,")); // Tool change supported (M6)
 
