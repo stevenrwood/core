@@ -3072,7 +3072,7 @@ status_code_t gc_execute_block (char *block)
                         axis_words.mask |= r_around.mask;
                     } else {
                         idx_0 = ffs(r_around.mask) - 1;
-                        bit_false(r_around.mask, bit(idx));
+                        bit_false(r_around.mask, bit(idx_0));   // clear the FIRST rotation axis to find the second (was bit(idx) - a stale loop var, which mis-set idx_1 -> the second axis's WCS offset got applied twice -> false soft-limit on rotated G54 XY moves)
                         idx_1 = ffs(r_around.mask) - 1;
                     }
 
