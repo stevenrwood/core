@@ -370,6 +370,10 @@ PROGMEM static const settings_t defaults = {
     .tool_change.seek_rate = DEFAULT_TOOLCHANGE_SEEK_RATE,
     .tool_change.pulloff_rate = DEFAULT_TOOLCHANGE_PULLOFF_RATE,
 
+    .macro_atc_flags.execute_m6t0 = DEFAULT_MACRO_ATC_OPTION_EXECUTEM6T0,
+    .macro_atc_flags.error_on_no_macro = DEFAULT_MACRO_ATC_ERROR_NO_MACRO,
+    .macro_atc_flags.random_toolchanger = DEFAULT_MACRO_ATC_RANDOM_TOOLCHANGER,
+
     .parking.flags.enabled = DEFAULT_PARKING_ENABLE,
     .parking.flags.deactivate_upon_init = DEFAULT_DEACTIVATE_PARKING_UPON_INIT,
     .parking.flags.enable_override_control= DEFAULT_ENABLE_PARKING_OVERRIDE_CONTROL,
@@ -385,7 +389,7 @@ PROGMEM static const settings_t defaults = {
     .safety_door.coolant_on_delay = DEFAULT_SAFETY_DOOR_COOLANT_DELAY,
 
     .fs_options.sd_mount_on_boot = DEFAULT_FS_SD_AUTOMOUNT,
-    .fs_options.lfs_hidden = DEFAULT_FS_LITLLEFS_HIDDEN,
+    .fs_options.lfs_hidden = DEFAULT_FS_LITTLEFS_HIDDEN,
     .fs_options.hierarchical_listing = DEFAULT_FS_HIERACHICAL_LISTING,
 
     .modbus_baud = DEFAULT_MODBUS_STREAM_BAUD,
@@ -608,9 +612,9 @@ FLASHMEM static status_code_t set_axis_mask (setting_id_t id, uint_fast16_t valu
 
         case Setting_LimitPinsInvertMask:
 #if COMPATIBILITY_LEVEL > 1
-    		settings.steppers.enable_invert.mask = value ? 0 : AXES_BITMASK;
+            settings.limits.invert.mask = value ? (~DEFAULT_LIMIT_SIGNALS_INVERT_MASK & AXES_BITMASK) : DEFAULT_LIMIT_SIGNALS_INVERT_MASK;
 #else
-    		settings.steppers.enable_invert.mask = value;
+            settings.limits.invert.mask = value;
 #endif
             break;
 
@@ -687,9 +691,9 @@ FLASHMEM static uint32_t get_axis_mask (setting_id_t id, uint_fast16_t int_value
 
         case Setting_LimitPinsInvertMask:
 #if COMPATIBILITY_LEVEL > 1
-            value = settings.steppers.enable_invert.mask == DEFAULT_LIMIT_SIGNALS_INVERT_MASK ? 0 : 1;
+            value = settings.limits.invert.mask == DEFAULT_LIMIT_SIGNALS_INVERT_MASK ? 0 : 1;
 #else
-            value = settings.steppers.enable_invert.mask;
+            value = settings.limits.invert.mask;
 #endif
             break;
 

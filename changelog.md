@@ -1,5 +1,66 @@
 ## grblHAL changelog
 
+<a name="20260709">Build 20260709
+
+Core:
+
+* Added support for MPG real time command character stream switching for RX only streams.
+
+Drivers:
+
+* RP2040: added support for optional third PIO based UART port. Added tentative map for Bolangsk board.
+
+---
+
+<a name="20260626">20260626
+
+Core:
+
+* Fix for asymmetric axis kinematics triggering soft limits when enabled.
+
+---
+
+<a name="20260622">Build 20260622
+
+Core:
+
+* PR#974 applied.
+
+* Added preprocessor logic for handling potentially bad spindle definitions.
+
+Plugins:
+
+* Spindle: added preprocessor validation of default spindle settings.
+
+---
+
+<a name="20260619">Build 20260619
+
+Core:
+
+* Made named O-call LinuxCNC compliant by changing name to lowercase.
+
+* Fix for parking motion using `$32` laser mode setting when it should use the current spindle mode.
+
+* For developers: changed signature of `hal.stream.on_linestate_changed()` to include stream properties.
+Currently the event only fires for native USB connections and it will now fire even if the current stream is not USB based.
+
+Drivers:
+
+* LPC176x, RP2040, STM32F1xx, STM32F3xx, STM32F4xx and STM32F7xx: updated for `hal.stream.on_linestate_changed()` signature change.
+> [!NOTE]
+> Other drivers that support native USB currently does not fire this event.
+
+* STM32F7xx: fixed typo that got committed. Ref. issue [#29](https://github.com/grblHAL/STM32F7xx/issues/29).
+
+Plugins:
+
+* SD card, macros: moved default values for `$675` - _Macro ATC Options_ to core.
+
+* SD card, stream: "hardened" code a bit.
+
+---
+
 <a name="20260618">Build 20260618
 
 Core:

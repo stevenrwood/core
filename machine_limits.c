@@ -429,7 +429,7 @@ FLASHMEM static bool homing_cycle (axes_signals_t cycle, axes_signals_t auto_squ
 
                 sys.homing_axis_lock.mask = axislock.mask;
 
-                if(autosquare_check && abs(initial_trigger_position - sys.position[dual_motor_axis]) > autosquare_fail_distance) {
+                if(autosquare_check && labs(initial_trigger_position - sys.position[dual_motor_axis]) > autosquare_fail_distance) {
                     system_set_exec_alarm(Alarm_HomingFailAutoSquaringApproach);
                     mc_reset();
                     protocol_execute_realtime();
@@ -525,6 +525,7 @@ FLASHMEM static bool homing_cycle (axes_signals_t cycle, axes_signals_t auto_squ
 #endif
         if(!limits_pull_off(auto_square, &distance, 1.0f))
             return false;
+        hal.stepper.disable_motors((axes_signals_t){0}, SquaringMode_Both);
     }
 
     // The active cycle axes should now be homed and machine limits have been located. By
@@ -626,7 +627,7 @@ FLASHMEM status_code_t limits_go_home (axes_signals_t cycle)
 // NOTE: Also used by jogging to block travel outside soft-limit volume.
 FLASHMEM void limits_soft_check (float *target, planner_cond_t condition)
 {
-#ifdef KINEMATICS_API
+#if defined(KINEMATICS_API) && !(defined(ASYMMETRIC_GANGING) || defined(ASYMMETRIC_AUTO_SQUARE))
     if(condition.target_validated ? !condition.target_valid : !grbl.check_travel_limits(target, sys.soft_limits, false, &sys.work_envelope)) {
 #else
     if(condition.target_validated ? !condition.target_valid : !grbl.check_travel_limits(target, sys.soft_limits, true, &sys.work_envelope)) {
