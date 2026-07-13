@@ -387,8 +387,19 @@ bool protocol_main_loop (void)
         // completed. In either case, auto-cycle start, if enabled, any queued moves.
         protocol_auto_cycle_start();
 
-        if(!protocol_execute_realtime() && sys.abort) // Runtime command check point.
+        if(!protocol_execute_realtime() && sys.abort) { // Runtime command check point.
+            // WEDGE-DBG (2026-07, temporary): the OTHER bail checkpoint (distinct from the per-line
+            // one already instrumented above) - runs once per outer while(true) iteration, after all
+            // currently-available characters are drained. If this is what's firing for the mystery
+            // reboot, sys.abort must be true here - see ioSender-side memory
+            // iosender-streamer-thread.md.
+            hal.stream.write_all("[MSG:WEDGE-DBG outer-loop bail: abort=1 cancel=");
+            hal.stream.write_all(sys.cancel ? "1" : "0");
+            hal.stream.write_all(" rt_exec_state=");
+            hal.stream.write_all(uitoa((uint32_t)sys.rt_exec_state));
+            hal.stream.write_all("]" ASCII_EOL);
             return !sys.flags.exit;                   // Bail to main() program loop to reset system.
+        }
 
         sys.cancel = false;
 
@@ -667,6 +678,14 @@ bool protocol_exec_rt_system (void)
         }
 
         if(rt_exec & EXEC_STOP) { // Experimental for now, must be verified. Do NOT move to interrupt context!
+
+            // WEDGE-DBG (2026-07, temporary): entry to the WHOLE EXEC_STOP branch, not just the
+            // alarm_pending sub-case - fires the instant rt_exec has EXEC_STOP set, regardless of what
+            // happens after. Cross-check against the CMD_STOP byte counter (this file) to see if
+            // EXEC_STOP is being processed without a matching CMD_STOP byte ever having arrived.
+            hal.stream.write_all("[MSG:WEDGE-DBG EXEC_STOP branch entered, rt_exec=");
+            hal.stream.write_all(uitoa((uint32_t)rt_exec));
+            hal.stream.write_all("]" ASCII_EOL);
 
             // Note: homing cannot be cancelled with EXEC_STOP
 
