@@ -204,6 +204,21 @@ FLASHMEM void report_init (void)
     get_rate_value = settings.flags.report_inches ? get_rate_value_inch : get_rate_value_mm;
 }
 
+// Reports the line number a fault relates to, as a standalone [MSG:Ln:<n>] line emitted
+// BEFORE the error:/ALARM: line. Deliberately not appended to that line (e.g. "error:71|Ln:15")
+// since some senders parse the digits right after "error:"/"ALARM:" as a bare integer - see
+// firmware-error-context-idea memory. Uses the same current-line source as the '?' status report's
+// own Ln: field (cur_block->line_number, falling back to gc_state.line_number).
+FLASHMEM static void report_line_number (void)
+{
+    if(hal.stream.is_connected()) {
+        plan_block_t *cur_block = plan_get_current_block();
+        line_number_t line_number = cur_block ? cur_block->line_number : gc_state.line_number;
+        if(line_number)
+            hal.stream.write(appendbuf(3, "[MSG:Ln:", uitoa(line_number), "]" ASCII_EOL));
+    }
+}
+
 // Handles the primary confirmation protocol response for streaming interfaces and human-feedback.
 // For every incoming line, this method responds with an 'ok' for a successful command or an
 // 'error:'  to indicate some error event with the line or some critical system error during
@@ -218,8 +233,10 @@ FLASHMEM static status_code_t report_status_message (status_code_t status)
     if(hal.stream.is_connected()) {
         if(status == Status_OK)
             hal.stream.write("ok" ASCII_EOL);
-        else
+        else {
+            report_line_number();
             hal.stream.write(appendbuf(3, "error:", uitoa((uint32_t)status), ASCII_EOL));
+        }
     }
 
     return status;
@@ -228,6 +245,7 @@ FLASHMEM static status_code_t report_status_message (status_code_t status)
 // Prints alarm messages.
 FLASHMEM static alarm_code_t report_alarm_message (alarm_code_t alarm_code)
 {
+    report_line_number();
     hal.stream.write_all(appendbuf(3, "ALARM:", uitoa((uint32_t)alarm_code), ASCII_EOL));
     hal.delay_ms(100, NULL); // Force delay to ensure message clears output stream buffer.
 
