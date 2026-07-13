@@ -240,8 +240,26 @@ bool protocol_main_loop (void)
                 } else
                     eol = (char)c;
 
-                if(!protocol_execute_realtime()) // Runtime command check point.
+                if(!protocol_execute_realtime()) { // Runtime command check point.
+                    // WEDGE-DBG (2026-07, temporary): this bail path re-enters the FULL reboot cycle
+                    // WITHOUT going through mc_reset() - confirmed via the mc_reset/reboot counters
+                    // (motion_control.c/grbllib.c) staying out of sync during a repro. Print exactly
+                    // why: sys.abort/sys.cancel (the two ABORTED bits, nuts_bolts.h), rt_exec_state,
+                    // and the accumulated line buffer (the line that triggered this bail, if any -
+                    // catches a corrupted/embedded stray byte). See ioSender-side memory
+                    // iosender-streamer-thread.md for the investigation this belongs to.
+                    hal.stream.write_all("[MSG:WEDGE-DBG bail: abort=");
+                    hal.stream.write_all(sys.abort ? "1" : "0");
+                    hal.stream.write_all(" cancel=");
+                    hal.stream.write_all(sys.cancel ? "1" : "0");
+                    hal.stream.write_all(" rt_exec_state=");
+                    hal.stream.write_all(uitoa((uint32_t)sys.rt_exec_state));
+                    hal.stream.write_all(" line=\"");
+                    line[char_counter] = '\0';
+                    hal.stream.write_all(line);
+                    hal.stream.write_all("\"]" ASCII_EOL);
                     return !sys.flags.exit;      // Bail to calling function upon system abort
+                }
 
                 line[char_counter] = '\0'; // Set string termination character.
 
