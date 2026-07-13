@@ -455,20 +455,14 @@ FLASHMEM int grbl_enter (void)
     while(looping) {
 
         // WEDGE-DBG (2026-07, temporary): capture sys.abort/cancel/position_lost/rt_exec_state
-        // BEFORE the memset below clears them, right at the top of the reinit loop - i.e. exactly
-        // why protocol_main_loop() just returned. If both abort and cancel are 0 here, the return
-        // didn't come from either of the two ABORTED-gated checkpoints in protocol_main_loop at
-        // all, which would rule out every path found by exhaustive source search so far - see
-        // ioSender-side memory iosender-streamer-thread.md.
-        hal.stream.write_all("[MSG:WEDGE-DBG reinit entry: abort=");
-        hal.stream.write_all(sys.abort ? "1" : "0");
-        hal.stream.write_all(" cancel=");
-        hal.stream.write_all(sys.cancel ? "1" : "0");
-        hal.stream.write_all(" position_lost=");
-        hal.stream.write_all(sys.position_lost ? "1" : "0");
-        hal.stream.write_all(" rt_exec_state=");
-        hal.stream.write_all(uitoa((uint32_t)sys.rt_exec_state));
-        hal.stream.write_all("]" ASCII_EOL);
+        // BEFORE the memset below clears them - i.e. exactly why protocol_main_loop() just returned.
+        // CAPTURE here, but PRINT later (right before the welcome banner, alongside the working
+        // "reboot count" print) - a write_all this early (before the stream is re-pointed to the
+        // active connection for this iteration) was silently swallowed, confirmed by it never
+        // appearing even for a known-good, expected reboot. See ioSender-side memory
+        // iosender-streamer-thread.md.
+        bool wedge_dbg_abort = sys.abort, wedge_dbg_cancel = sys.cancel, wedge_dbg_pos_lost = sys.position_lost;
+        rt_exec_t wedge_dbg_rt_exec_state = sys.rt_exec_state;
 
         spindle_num_t spindle_num = N_SYS_SPINDLE;
 
@@ -532,6 +526,14 @@ FLASHMEM int grbl_enter (void)
             static uint32_t wedge_dbg_reboot_count = 0;
             hal.stream.write_all("[MSG:WEDGE-DBG reboot count=");
             hal.stream.write_all(uitoa(++wedge_dbg_reboot_count));
+            hal.stream.write_all(" abort=");
+            hal.stream.write_all(wedge_dbg_abort ? "1" : "0");
+            hal.stream.write_all(" cancel=");
+            hal.stream.write_all(wedge_dbg_cancel ? "1" : "0");
+            hal.stream.write_all(" position_lost=");
+            hal.stream.write_all(wedge_dbg_pos_lost ? "1" : "0");
+            hal.stream.write_all(" rt_exec_state=");
+            hal.stream.write_all(uitoa((uint32_t)wedge_dbg_rt_exec_state));
             hal.stream.write_all("]" ASCII_EOL);
         }
 
