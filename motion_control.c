@@ -1158,11 +1158,20 @@ FLASHMEM void mc_override_ctrl_update (gc_override_flags_t override_state)
 // is in a motion state. If so, kills the steppers and sets the system alarm to flag position
 // lost, since there was an abrupt uncontrolled deceleration. Called at an interrupt level by
 // realtime abort command and hard limits. So, keep to a minimum.
+// WEDGE-DBG (2026-07, temporary): counts how many times mc_reset() actually processes a NEW reset
+// (i.e. gets past the reentry guard below) - read/reported from protocol_exec_rt_system (main-loop
+// context, safe to print from there). If this climbs more than once per an actual physical Reset
+// press, the controller is re-triggering its own reset/reboot cycle internally, which would explain
+// "$X/$H/$I never get an ok, just Alarm re-prints and repeated reboots" without needing a second
+// press - see ioSender-side memory iosender-streamer-thread.md for the investigation this belongs to.
+volatile uint32_t wedge_dbg_mc_reset_count = 0;
+
 ISR_CODE void ISR_FUNC(mc_reset)(void)
 {
     // Only this function can set the system reset. Helps prevent multiple kill calls.
     if(bit_isfalse(sys.rt_exec_state, EXEC_RESET)) {
 
+        wedge_dbg_mc_reset_count++;
         system_set_exec_state_flag(EXEC_RESET);
 
         if(sys.reset_pending || sys.blocking_event)

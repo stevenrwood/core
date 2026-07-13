@@ -508,6 +508,17 @@ FLASHMEM int grbl_enter (void)
         if(!hal.driver_cap.atc)
             tc_init();
 
+        // WEDGE-DBG (2026-07, temporary): count + report each full reboot cycle, right before the
+        // welcome banner. Compared against mc_reset()'s own fire-count (motion_control.c) to tell
+        // whether reboots are being triggered ONLY via mc_reset(), or via some other path that sets
+        // sys.abort without going through it - see ioSender-side memory iosender-streamer-thread.md.
+        {
+            static uint32_t wedge_dbg_reboot_count = 0;
+            hal.stream.write_all("[MSG:WEDGE-DBG reboot count=");
+            hal.stream.write_all(uitoa(++wedge_dbg_reboot_count));
+            hal.stream.write_all("]" ASCII_EOL);
+        }
+
         // Print welcome message. Indicates an initialization has occurred at power-up or with a reset.
         grbl.report.init_message(hal.stream.write_all);
 

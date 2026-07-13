@@ -477,6 +477,21 @@ bool protocol_exec_rt_system (void)
         hal.stream.write_all("[MSG:WEDGE-DBG Reset ignored - e_stop input reads asserted]" ASCII_EOL);
     }
 
+    // WEDGE-DBG: report every increment of mc_reset()'s own fire-count (motion_control.c) - if this
+    // climbs more than once per an actual physical Reset press, the controller is re-triggering its
+    // own reset internally without user action.
+    {
+        extern volatile uint32_t wedge_dbg_mc_reset_count;
+        static uint32_t wedge_dbg_last_seen = 0;
+        uint32_t now = wedge_dbg_mc_reset_count;
+        if(now != wedge_dbg_last_seen) {
+            wedge_dbg_last_seen = now;
+            hal.stream.write_all("[MSG:WEDGE-DBG mc_reset fired, count=");
+            hal.stream.write_all(uitoa(now));
+            hal.stream.write_all("]" ASCII_EOL);
+        }
+    }
+
     if (sys.rt_exec_alarm && (rt_exec = system_clear_exec_alarm())) { // Enter only if any bit flag is true
 
         if((sys.reset_pending = bit_istrue(sys.rt_exec_state, EXEC_RESET))) {
