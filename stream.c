@@ -495,10 +495,15 @@ FLASHMEM static bool stream_select (const io_stream_t *stream, bool add)
     // WEDGE-DBG (2026-07, temporary): every call, regardless of stream type or add/remove - this is
     // the entry point for stream_connect()/stream_disconnect(), one of which runs whenever a new
     // Telnet client connects (telnetd.c) or the USB serial link is (re)established. See ioSender-side
-    // memory iosender-streamer-thread.md.
-    hal.stream.write_all("[MSG:WEDGE-DBG stream_select: type=");
-    hal.stream.write_all(uitoa((uint32_t)stream->type));
-    hal.stream.write_all(add ? " add=1]" ASCII_EOL : " add=0]" ASCII_EOL);
+    // memory iosender-streamer-thread.md. GUARDED: hal.stream.write_all is not yet assigned on the
+    // very first call (initial driver setup calls this before hal.stream is fully populated) -
+    // calling through it unconditionally here crashed/hung the boot entirely (confirmed - this broke
+    // both Serial and Telnet connectivity outright).
+    if(hal.stream.write_all) {
+        hal.stream.write_all("[MSG:WEDGE-DBG stream_select: type=");
+        hal.stream.write_all(uitoa((uint32_t)stream->type));
+        hal.stream.write_all(add ? " add=1]" ASCII_EOL : " add=0]" ASCII_EOL);
+    }
 
     bool send_init_message = false, mpg_enable = false;
 
