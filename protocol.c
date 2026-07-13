@@ -218,6 +218,21 @@ bool protocol_main_loop (void)
         // initial filtering by removing leading spaces and control characters.
         while((c = hal.stream.read()) != SERIAL_NO_DATA) {
 
+            // WEDGE-DBG (2026-07, temporary): the MOST fundamental trace - every single character
+            // actually read from the stream via hal.stream.read(), the true ground truth for whether
+            // anything the user types is even reaching the parser at all. Only fires on real data
+            // (not SERIAL_NO_DATA), so bounded by actual traffic. See ioSender-side memory
+            // iosender-streamer-thread.md.
+            {
+                char dbgc[8];
+                dbgc[0] = '['; dbgc[1] = (char)c; dbgc[2] = ']';
+                dbgc[3] = '\0';
+                hal.stream.write_all("[MSG:WEDGE-DBG char read: ");
+                hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
+                hal.stream.write_all(c >= 0x20 && c < 0x7F ? dbgc : "[?]");
+                hal.stream.write_all("]" ASCII_EOL);
+            }
+
             if(c == ASCII_CAN) {
 
                 eol = xcommand[0] = '\0';
