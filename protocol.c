@@ -286,7 +286,19 @@ bool protocol_main_loop (void)
                     hal.stream.write("]" ASCII_EOL);
                     gc_state.last_error = Status_OK;
                 } else if(*line == '$') {// grblHAL '$' system command
-                    if((gc_state.last_error = system_execute_line(line)) == Status_LimitsEngaged) {
+                    // WEDGE-DBG (2026-07, temporary): trace every '$'-command dispatch and its result
+                    // code - confirms whether $X is actually reaching system_execute_line() at all,
+                    // since neither disable_lock() nor any of the alarm-reraise paths have been seen
+                    // to fire despite $X visibly failing to unlock every time. See ioSender-side
+                    // memory iosender-streamer-thread.md.
+                    hal.stream.write_all("[MSG:WEDGE-DBG dispatching '$' line=\"");
+                    hal.stream.write_all(line);
+                    hal.stream.write_all("\"]" ASCII_EOL);
+                    gc_state.last_error = system_execute_line(line);
+                    hal.stream.write_all("[MSG:WEDGE-DBG '$' dispatch result=");
+                    hal.stream.write_all(uitoa((uint32_t)gc_state.last_error));
+                    hal.stream.write_all("]" ASCII_EOL);
+                    if(gc_state.last_error == Status_LimitsEngaged) {
                         system_raise_alarm(Alarm_LimitsEngaged);
                         grbl.report.feedback_message(Message_CheckLimits);
                     }
