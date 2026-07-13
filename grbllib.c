@@ -454,6 +454,22 @@ FLASHMEM int grbl_enter (void)
     // will return to this loop to be cleanly re-initialized.
     while(looping) {
 
+        // WEDGE-DBG (2026-07, temporary): capture sys.abort/cancel/position_lost/rt_exec_state
+        // BEFORE the memset below clears them, right at the top of the reinit loop - i.e. exactly
+        // why protocol_main_loop() just returned. If both abort and cancel are 0 here, the return
+        // didn't come from either of the two ABORTED-gated checkpoints in protocol_main_loop at
+        // all, which would rule out every path found by exhaustive source search so far - see
+        // ioSender-side memory iosender-streamer-thread.md.
+        hal.stream.write_all("[MSG:WEDGE-DBG reinit entry: abort=");
+        hal.stream.write_all(sys.abort ? "1" : "0");
+        hal.stream.write_all(" cancel=");
+        hal.stream.write_all(sys.cancel ? "1" : "0");
+        hal.stream.write_all(" position_lost=");
+        hal.stream.write_all(sys.position_lost ? "1" : "0");
+        hal.stream.write_all(" rt_exec_state=");
+        hal.stream.write_all(uitoa((uint32_t)sys.rt_exec_state));
+        hal.stream.write_all("]" ASCII_EOL);
+
         spindle_num_t spindle_num = N_SYS_SPINDLE;
 
         // Reset report entry points
