@@ -36,12 +36,19 @@
 #endif
 
 DCRAM static stream_rx_buffer_t rxbackup;
+DCRAM static stream_rx_linebuffer_t linerxbackup;
 
 typedef struct {
     enqueue_realtime_command_ptr enqueue_realtime_command;
     stream_read_ptr read;
     stream_rx_buffer_t *rxbuffer;
 } stream_state_t;
+
+typedef struct {
+    enqueue_realtime_command_ptr enqueue_realtime_command;
+    stream_read_ptr read;
+    stream_rx_linebuffer_t *rxbuffer;
+} stream_linebuffer_state_t;
 
 typedef union {
     uint8_t value;
@@ -74,6 +81,7 @@ static io_stream_details_t null_streams = {
 };
 
 static stream_state_t stream = {0};
+static stream_linebuffer_state_t linestream = {0};
 static io_stream_details_t *streams = &null_streams;
 static stream_connection_t base = {0}, *connections = &base;
 static struct {
@@ -174,7 +182,13 @@ ISR_CODE static bool ISR_FUNC(await_toolchange_ack)(uint8_t c)
 
 FLASHMEM stream_suspend_state_t stream_is_rx_suspended (void)
 {
-    return stream.rxbuffer ? (stream.rxbuffer->backup ? StreamSuspend_Active : StreamSuspend_Pending) : StreamSuspend_Off;
+    if(stream.rxbuffer)
+        return stream.rxbuffer->backup ? StreamSuspend_Active : StreamSuspend_Pending;
+
+    if(linestream.rxbuffer)
+        return linestream.rxbuffer->backup ? StreamSuspend_Active : StreamSuspend_Pending;
+
+    return StreamSuspend_Off;
 }
 
 FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
@@ -197,6 +211,126 @@ FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
             stream.enqueue_realtime_command = NULL;
         }
         stream.rxbuffer = NULL;
+    }
+
+    return ok;
+}
+
+// --- line-ring RX buffer (stream_rx_linebuffer_t) - see stream.h for the design rationale ---
+
+bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
+{
+    bool is_eol = c == ASCII_LF || c == ASCII_CR;
+    uint_fast16_t n = rxbuffer->len[rxbuffer->head];
+
+    if(is_eol) {
+        uint_fast8_t next_head = LINEBUFNEXT(rxbuffer->head);
+        if(next_head == rxbuffer->tail) {
+            rxbuffer->overflow = true; // ring full - reject, caller should retry this same character later
+            return false;
+        }
+        if(n < RX_LINE_LENGTH)
+            rxbuffer->data[rxbuffer->head][n++] = c;
+        rxbuffer->len[rxbuffer->head] = n;
+        rxbuffer->head = next_head;
+    } else if(n < RX_LINE_LENGTH) {
+        rxbuffer->data[rxbuffer->head][n++] = c;
+        rxbuffer->len[rxbuffer->head] = n;
+    } else
+        rxbuffer->overflow = true; // line too long, drop the excess but keep scanning for the terminator
+
+    return true;
+}
+
+int32_t stream_rx_linebuffer_get (stream_rx_linebuffer_t *rxbuffer)
+{
+    if(rxbuffer->tail == rxbuffer->head)
+        return SERIAL_NO_DATA; // no completed line queued
+
+    int32_t c = (int32_t)(uint8_t)rxbuffer->data[rxbuffer->tail][rxbuffer->rpos++];
+
+    if(rxbuffer->rpos >= rxbuffer->len[rxbuffer->tail]) {
+        rxbuffer->len[rxbuffer->tail] = 0;
+        rxbuffer->rpos = 0;
+        rxbuffer->tail = LINEBUFNEXT(rxbuffer->tail);
+    }
+
+    return c;
+}
+
+uint16_t stream_rx_linebuffer_count (stream_rx_linebuffer_t *rxbuffer)
+{
+    uint_fast8_t head = rxbuffer->head, tail = rxbuffer->tail;
+    uint_fast8_t n = (head >= tail) ? (head - tail) : (RX_LINE_BUFFERS - tail + head);
+
+    return (uint16_t)(n * RX_LINE_LENGTH);
+}
+
+uint16_t stream_rx_linebuffer_free (stream_rx_linebuffer_t *rxbuffer)
+{
+    uint_fast8_t head = rxbuffer->head, tail = rxbuffer->tail;
+    uint_fast8_t used = (head >= tail) ? (head - tail) : (RX_LINE_BUFFERS - tail + head);
+
+    return (uint16_t)((RX_LINE_BUFFERS - 1 - used) * RX_LINE_LENGTH);
+}
+
+void stream_rx_linebuffer_flush (stream_rx_linebuffer_t *rxbuffer)
+{
+    uint_fast8_t i;
+
+    for(i = 0; i < RX_LINE_BUFFERS; i++)
+        rxbuffer->len[i] = 0;
+
+    rxbuffer->head = rxbuffer->tail = 0;
+    rxbuffer->rpos = 0;
+}
+
+void stream_rx_linebuffer_cancel (stream_rx_linebuffer_t *rxbuffer)
+{
+    stream_rx_linebuffer_flush(rxbuffer);
+
+    rxbuffer->data[rxbuffer->head][0] = ASCII_CAN;
+    rxbuffer->len[rxbuffer->head] = 1;
+    rxbuffer->head = LINEBUFNEXT(rxbuffer->head);
+}
+
+ISR_CODE static bool ISR_FUNC(await_toolchange_ack_linebuffer)(uint8_t c)
+{
+    if(c == CMD_TOOL_ACK && !linestream.rxbuffer->backup) {
+        memcpy(&linerxbackup, linestream.rxbuffer, sizeof(stream_rx_linebuffer_t));
+        linestream.rxbuffer->backup = true;
+        linestream.rxbuffer->tail = linestream.rxbuffer->head;
+        hal.stream.read = linestream.read; // restore normal input
+        hal.stream.set_enqueue_rt_handler(linestream.enqueue_realtime_command);
+        linestream.enqueue_realtime_command = NULL;
+        if(grbl.on_toolchange_ack)
+            grbl.on_toolchange_ack();
+    } else
+        return linestream.enqueue_realtime_command(c);
+
+    return true;
+}
+
+FLASHMEM bool stream_rx_linebuffer_suspend (stream_rx_linebuffer_t *rxbuffer, bool suspend)
+{
+    bool ok = false;
+
+    if(suspend) {
+        if((ok = linestream.rxbuffer == NULL)) {
+            linestream.rxbuffer = rxbuffer;
+            linestream.read = hal.stream.read;
+            linestream.enqueue_realtime_command = hal.stream.set_enqueue_rt_handler(await_toolchange_ack_linebuffer);
+            hal.stream.read = stream_get_null;
+        }
+    } else if((ok = linestream.rxbuffer != NULL)) {
+        if(rxbuffer->backup)
+            memcpy(rxbuffer, &linerxbackup, sizeof(stream_rx_linebuffer_t));
+        if(linestream.enqueue_realtime_command) {
+            hal.stream.read = linestream.read; // restore normal input
+            hal.stream.set_enqueue_rt_handler(linestream.enqueue_realtime_command);
+            linestream.enqueue_realtime_command = NULL;
+        }
+        linestream.rxbuffer = NULL;
     }
 
     return ok;

@@ -428,6 +428,39 @@ typedef struct {
     uint8_t data[RX_BUFFER_SIZE];
 } stream_rx_buffer_t;
 
+#ifndef RX_LINE_BUFFERS
+#define RX_LINE_BUFFERS 64 // number of whole-line slots, must be a power of 2
+#endif
+
+#ifndef RX_LINE_LENGTH
+#define RX_LINE_LENGTH 256 // max bytes per line slot (including the terminator), matches grbl's own LINE_BUFFER_SIZE - 1
+#endif
+
+#define LINEBUFNEXT(slot) (((slot) + 1) & (RX_LINE_BUFFERS - 1))
+
+/*! \brief A "ring of whole lines" RX buffer, opt-in alternative to stream_rx_buffer_t for stream drivers
+that see line-oriented (g-code) text traffic - currently USB serial and telnet.
+
+The producer (driver ISR/poll/network callback) fills the slot at \a head one character at a time via
+stream_rx_linebuffer_put(); a line terminator (CR or LF) closes that slot and advances \a head. The
+consumer (hal.stream.read, via stream_rx_linebuffer_get()) drains slots from \a tail one character at a
+time, in original wire order with terminators intact, so from grbl core's point of view it is a
+byte-for-byte drop-in replacement for stream_rx_buffer_t - only the producer-side bookkeeping (and
+therefore overflow behavior) differs: a line can never be split or corrupted mid-flight, and "buffer
+full" becomes a simple head-catches-tail slot check rather than the remaining-byte-budget calculation a
+SENDER previously had to track via the Bf: status field. See firmware-line-ring-buffer-idea memory (ioSender
+project) for the motivating discussion.
+*/
+typedef struct {
+    volatile uint_fast8_t head;                     //!< slot currently being filled by the producer
+    volatile uint_fast8_t tail;                     //!< slot currently being drained by the consumer
+    volatile uint_fast16_t rpos;                    //!< read offset within the tail slot
+    volatile uint_fast16_t len[RX_LINE_BUFFERS];     //!< bytes written so far into each slot, 0 = empty/available
+    volatile bool overflow;                          //!< set when a completed line had to be dropped (ring full) or truncated (line > RX_LINE_LENGTH)
+    bool backup;                                     //!< true while this buffer holds tool-change-ack input, mirrors stream_rx_buffer_t.backup
+    char data[RX_LINE_BUFFERS][RX_LINE_LENGTH];
+} stream_rx_linebuffer_t;
+
 typedef struct {
     volatile uint_fast16_t head;
     volatile uint_fast16_t tail;
@@ -473,6 +506,41 @@ int32_t stream_get_null (void);
  bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend);
 
  stream_suspend_state_t stream_is_rx_suspended (void);
+
+/*! \brief Adds a raw received character to a line-ring RX buffer, closing the current slot on a line
+terminator (CR or LF). Excess characters within an over-length line are dropped, but still consumed
+(matching protocol.c's own LINE_BUFFER_SIZE overflow handling - it still needs to see the terminator to
+know the line is done), setting \a overflow. A terminator arriving when the ring has no free slot left
+is REJECTED (not consumed, \a overflow set) so a caller wired to a retryable source (e.g. TCP, where the
+byte simply is not yet acknowledged) gets real backpressure instead of silently losing the completed line;
+a caller with no such retry path (e.g. a local polled buffer) may just ignore the return value.
+\param rxbuffer pointer to a stream_rx_linebuffer_t.
+\param c the received character.
+\returns \a false if \a c was a line terminator that could not be accepted (ring full) - the caller
+should retry the SAME character later. \a true otherwise (accepted, or silently dropped as line-overflow filler).
+*/
+bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c);
+
+/*! \brief Reads the next character from a line-ring RX buffer, in original wire order.
+\param rxbuffer pointer to a stream_rx_linebuffer_t.
+\returns character or SERIAL_NO_DATA if none available.
+*/
+int32_t stream_rx_linebuffer_get (stream_rx_linebuffer_t *rxbuffer);
+
+/*! \brief Number of bytes available for the next read() across all completed lines (an estimate - status-report/display use only). */
+uint16_t stream_rx_linebuffer_count (stream_rx_linebuffer_t *rxbuffer);
+
+/*! \brief Number of bytes of headroom left in the ring (an estimate - status-report/display use only, see stream_rx_linebuffer_count). */
+uint16_t stream_rx_linebuffer_free (stream_rx_linebuffer_t *rxbuffer);
+
+/*! \brief Discards all queued and in-progress input. */
+void stream_rx_linebuffer_flush (stream_rx_linebuffer_t *rxbuffer);
+
+/*! \brief Discards all queued and in-progress input, then injects a single #ASCII_CAN character as the next byte to be read. */
+void stream_rx_linebuffer_cancel (stream_rx_linebuffer_t *rxbuffer);
+
+/*! \brief Line-ring buffer equivalent of stream_rx_suspend(), see there for behavior. */
+bool stream_rx_linebuffer_suspend (stream_rx_linebuffer_t *rxbuffer, bool suspend);
 
 bool stream_mpg_register (const io_stream_t *stream, bool rx_only, stream_write_char_ptr write_char);
 

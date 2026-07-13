@@ -55,6 +55,7 @@ static uint_fast16_t char_counter = 0;
 static char line[LINE_BUFFER_SIZE]; // Line to be executed. Zero-terminated.
 static char xcommand[LINE_BUFFER_SIZE];
 static bool keep_rt_commands = false;
+static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see protocol_main_loop
 
 static void protocol_exec_rt_suspend (sys_state_t state);
 
@@ -246,7 +247,19 @@ bool protocol_main_loop (void)
                     gc_state.last_error = Status_Overflow;
                 else if(*line == '\0') // Empty line. For syncing purposes.
                     gc_state.last_error = Status_OK;
-                else if(*line == '$') {// grblHAL '$' system command
+                else if(!strncmp(line, "$ECHO=", 6)) {
+                    // RX-stream loopback test: bounces every subsequent line straight back out,
+                    // never reaching the g-code parser or motion system - lets a rapid-fire burst
+                    // (e.g. mashing a jog button) be verified byte-for-byte against the RX line-ring
+                    // buffer with zero risk of real movement. $ECHO=1 arms it, $ECHO=0 disarms.
+                    echo_test_mode = line[6] != '0';
+                    gc_state.last_error = Status_OK;
+                } else if(echo_test_mode) {
+                    hal.stream.write("[ECHO:");
+                    hal.stream.write(line);
+                    hal.stream.write("]" ASCII_EOL);
+                    gc_state.last_error = Status_OK;
+                } else if(*line == '$') {// grblHAL '$' system command
                     if((gc_state.last_error = system_execute_line(line)) == Status_LimitsEngaged) {
                         system_raise_alarm(Alarm_LimitsEngaged);
                         grbl.report.feedback_message(Message_CheckLimits);
