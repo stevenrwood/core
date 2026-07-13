@@ -63,6 +63,7 @@ static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see 
 // promote to permanent (behind a $-setting or debug build flag) if it proves its worth.
 static volatile bool wedge_dbg_reset_blocked_estop = false; // set in ISR, see protocol_enqueue_realtime_command
 static bool wedge_dbg_stop_wait_logged = false;             // one-shot guard, EXEC_STOP wait-for-stop loop
+static volatile uint32_t wedge_dbg_cmd_stop_count = 0;      // set in ISR, see CMD_STOP case below
 
 static void protocol_exec_rt_suspend (sys_state_t state);
 
@@ -510,6 +511,21 @@ bool protocol_exec_rt_system (void)
         }
     }
 
+    // WEDGE-DBG: report every increment of the CMD_STOP realtime-byte counter (this file, ISR case
+    // above) - the only known direct setter of EXEC_STOP. If EXEC_STOP ends up processed (see the
+    // "EXEC_STOP branch: re-raising alarm_pending" print) without this counter climbing, EXEC_STOP
+    // is being set from somewhere not yet found.
+    {
+        static uint32_t wedge_dbg_last_seen = 0;
+        uint32_t now = wedge_dbg_cmd_stop_count;
+        if(now != wedge_dbg_last_seen) {
+            wedge_dbg_last_seen = now;
+            hal.stream.write_all("[MSG:WEDGE-DBG CMD_STOP byte seen, count=");
+            hal.stream.write_all(uitoa(now));
+            hal.stream.write_all("]" ASCII_EOL);
+        }
+    }
+
     if (sys.rt_exec_alarm && (rt_exec = system_clear_exec_alarm())) { // Enter only if any bit flag is true
 
         if((sys.reset_pending = bit_istrue(sys.rt_exec_state, EXEC_RESET))) {
@@ -672,6 +688,16 @@ bool protocol_exec_rt_system (void)
             sys.flags.keep_input = Off;
 
             if(sys.alarm_pending) {
+
+                // WEDGE-DBG (2026-07, temporary): this is the EXEC_STOP handling branch (this whole
+                // block is entered when rt_exec & EXEC_STOP) re-raising a PENDING alarm. Neither
+                // mc_reset() nor disable_lock() ($X's handler) are known to set sys.alarm_pending or
+                // EXEC_STOP - if this fires, it proves EXEC_STOP itself is getting set from somewhere
+                // not yet found (protocol.c's CMD_STOP realtime-byte case is the only known direct
+                // setter). See ioSender-side memory iosender-streamer-thread.md.
+                hal.stream.write_all("[MSG:WEDGE-DBG EXEC_STOP branch: re-raising alarm_pending=");
+                hal.stream.write_all(uitoa((uint32_t)sys.alarm_pending));
+                hal.stream.write_all("]" ASCII_EOL);
 
                 sys.position_lost = st_is_stepping();
                 system_raise_alarm(sys.alarm_pending);
@@ -960,6 +986,7 @@ ISR_CODE bool ISR_FUNC(protocol_enqueue_realtime_command)(uint8_t c)
             break;
 
         case CMD_STOP:
+            wedge_dbg_cmd_stop_count++; // WEDGE-DBG: see the report site in protocol_exec_rt_system
             system_set_exec_state_flag(EXEC_STOP);
             char_counter = 0;
             hal.stream.cancel_read_buffer();
