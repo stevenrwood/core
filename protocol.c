@@ -57,6 +57,13 @@ static char xcommand[LINE_BUFFER_SIZE];
 static bool keep_rt_commands = false;
 static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see protocol_main_loop
 
+// WEDGE-DBG (2026-07, temporary): instrumentation for the "Reset/Feed-Hold/Stop wedges the controller,
+// only a power-cycle clears it" investigation (see ioSender-side memory iosender-streamer-thread.md,
+// "Reproduced 5x across 3 triggers"). Print-only, no behavior change - remove once root-caused, or
+// promote to permanent (behind a $-setting or debug build flag) if it proves its worth.
+static volatile bool wedge_dbg_reset_blocked_estop = false; // set in ISR, see protocol_enqueue_realtime_command
+static bool wedge_dbg_stop_wait_logged = false;             // one-shot guard, EXEC_STOP wait-for-stop loop
+
 static void protocol_exec_rt_suspend (sys_state_t state);
 
 // add gcode to execute not originating from normal input stream
@@ -461,6 +468,15 @@ bool protocol_exec_rt_system (void)
     rt_exec_t rt_exec;
     bool killed = false;
 
+    // WEDGE-DBG: report a Reset that the ISR silently dropped because e_stop read asserted at that
+    // instant - see the CMD_RESET case in protocol_enqueue_realtime_command. Reported here (main-loop
+    // context) rather than in the ISR. One-shot per assertion so a stuck/latched e_stop input doesn't
+    // flood the log if the user presses Reset repeatedly while it's stuck.
+    if(wedge_dbg_reset_blocked_estop) {
+        wedge_dbg_reset_blocked_estop = false;
+        hal.stream.write_all("[MSG:WEDGE-DBG Reset ignored - e_stop input reads asserted]" ASCII_EOL);
+    }
+
     if (sys.rt_exec_alarm && (rt_exec = system_clear_exec_alarm())) { // Enter only if any bit flag is true
 
         if((sys.reset_pending = bit_istrue(sys.rt_exec_state, EXEC_RESET))) {
@@ -506,6 +522,21 @@ bool protocol_exec_rt_system (void)
 
             system_clear_exec_state_flag(EXEC_RESET); // Disable any existing reset
 
+            // WEDGE-DBG: this loop blocks EVERYTHING except status reports until Reset arrives AND the
+            // e_stop/motor_fault control signals both read clear - matches the already-observed symptom
+            // of "$X looped forever, controller re-printed its boot banner between attempts" (see
+            // ioSender-side memory iosender-streamer-thread.md). Print once on entry (which alarm, which
+            // signal bits) and once more every ~2s while still stuck, so a repro shows whether the signal
+            // bits ever actually change or the loop is genuinely stuck forever on a latched/false read.
+            {
+                control_signals_t dbg_sig = hal.control.get_state();
+                hal.stream.write_all(dbg_sig.e_stop
+                    ? "[MSG:WEDGE-DBG blocking_event entered, e_stop asserted]" ASCII_EOL
+                    : (dbg_sig.motor_fault
+                        ? "[MSG:WEDGE-DBG blocking_event entered, motor_fault asserted]" ASCII_EOL
+                        : "[MSG:WEDGE-DBG blocking_event entered, neither signal asserted (?)]" ASCII_EOL));
+            }
+
             while(!(sys.abort = bit_istrue(sys.rt_exec_state, EXEC_RESET)) || (hal.control.get_state().bits & blocking_signals.bits)) {
 
                 // Block everything, except reset and status reports, until user issues reset or power
@@ -517,6 +548,21 @@ bool protocol_exec_rt_system (void)
                 if(bit_istrue(sys.rt_exec_state, EXEC_STATUS_REPORT)) {
                     system_clear_exec_state_flag(EXEC_STATUS_REPORT);
                     report_realtime_status(hal.stream.write_all, &hal.stream.report);
+                }
+
+                // WEDGE-DBG: throttled "still stuck" marker, ~every 2s, showing the live signal bits.
+                {
+                    static uint32_t wedge_dbg_last_ms = 0;
+                    uint32_t now_ms = hal.get_elapsed_ticks();
+                    if(now_ms - wedge_dbg_last_ms > 2000) {
+                        wedge_dbg_last_ms = now_ms;
+                        control_signals_t dbg_sig = hal.control.get_state();
+                        hal.stream.write_all(dbg_sig.e_stop
+                            ? "[MSG:WEDGE-DBG blocking_event still stuck, e_stop still asserted]" ASCII_EOL
+                            : (dbg_sig.motor_fault
+                                ? "[MSG:WEDGE-DBG blocking_event still stuck, motor_fault still asserted]" ASCII_EOL
+                                : "[MSG:WEDGE-DBG blocking_event still stuck, no reset received yet]" ASCII_EOL));
+                    }
                 }
 
                 protocol_poll_cmd();
@@ -588,9 +634,22 @@ bool protocol_exec_rt_system (void)
 
                 state_update(EXEC_MOTION_CANCEL_FAST);
 
+                // WEDGE-DBG: this loop (EXEC_STOP handling, marked "Experimental for now, must be
+                // verified" by its own author-comment above) waits here until st_is_stepping() clears -
+                // if the segment buffer/stepper ISR ever fails to signal completion, this spins forever.
+                // One-shot print if it's still going after ~2s, since the STOP button (not Reset or Feed
+                // Hold) is one of the three already-recorded wedge triggers (see ioSender-side memory
+                // iosender-streamer-thread.md).
+                uint32_t wedge_dbg_stop_start_ms = hal.get_elapsed_ticks();
+                wedge_dbg_stop_wait_logged = false;
+
                 do {
                     st_prep_buffer(); // Check and prep segment buffer.
                     grbl.on_execute_realtime(state_get());
+                    if(!wedge_dbg_stop_wait_logged && hal.get_elapsed_ticks() - wedge_dbg_stop_start_ms > 2000) {
+                        wedge_dbg_stop_wait_logged = true;
+                        hal.stream.write_all("[MSG:WEDGE-DBG EXEC_STOP wait-for-stop loop stuck >2s, st_is_stepping still true]" ASCII_EOL);
+                    }
                 } while(st_is_stepping());
 
                 rt_exec |= system_clear_exec_states();
@@ -864,6 +923,8 @@ ISR_CODE bool ISR_FUNC(protocol_enqueue_realtime_command)(uint8_t c)
         case CMD_RESET: // Call motion control reset routine.
             if(!hal.control.get_state().e_stop)
                 mc_reset();
+            else
+                wedge_dbg_reset_blocked_estop = true; // WEDGE-DBG: Reset is a silent no-op while e_stop reads asserted - reported from protocol_exec_rt_system, not here (ISR context)
             drop = true;
             break;
 
