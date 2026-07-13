@@ -218,6 +218,25 @@ FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
 
 // --- line-ring RX buffer (stream_rx_linebuffer_t) - see stream.h for the design rationale ---
 
+// WEDGE-DBG (2026-07, temporary): print raw ring state whenever this function does something
+// anomalous (rejects a terminator because the ring is full, or truncates an over-length line).
+// These are the two ways a line can be silently lost/corrupted from here - see protocol.c's own
+// WEDGE-DBG block for the wider investigation this belongs to.
+static void wedge_dbg_dump_ring (stream_rx_linebuffer_t *rxbuffer, const char *why)
+{
+    hal.stream.write_all("[MSG:WEDGE-DBG linebuf ");
+    hal.stream.write_all(why);
+    hal.stream.write_all(" head=");
+    hal.stream.write_all(uitoa(rxbuffer->head));
+    hal.stream.write_all(" tail=");
+    hal.stream.write_all(uitoa(rxbuffer->tail));
+    hal.stream.write_all(" rpos=");
+    hal.stream.write_all(uitoa(rxbuffer->rpos));
+    hal.stream.write_all(" len[head]=");
+    hal.stream.write_all(uitoa(rxbuffer->len[rxbuffer->head]));
+    hal.stream.write_all("]" ASCII_EOL);
+}
+
 bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
 {
     bool is_eol = c == ASCII_LF || c == ASCII_CR;
@@ -227,6 +246,7 @@ bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
         uint_fast8_t next_head = LINEBUFNEXT(rxbuffer->head);
         if(next_head == rxbuffer->tail) {
             rxbuffer->overflow = true; // ring full - reject, caller should retry this same character later
+            wedge_dbg_dump_ring(rxbuffer, "terminator rejected, ring full");
             return false;
         }
         if(n < RX_LINE_LENGTH)
@@ -236,8 +256,17 @@ bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
     } else if(n < RX_LINE_LENGTH) {
         rxbuffer->data[rxbuffer->head][n++] = c;
         rxbuffer->len[rxbuffer->head] = n;
-    } else
+    } else {
         rxbuffer->overflow = true; // line too long, drop the excess but keep scanning for the terminator
+        // WEDGE-DBG: len[head] pins at RX_LINE_LENGTH once truncation starts (never increments further),
+        // so gate on elapsed time rather than a byte count to avoid flooding on a long excess run.
+        static uint32_t wedge_dbg_last_ms = 0;
+        uint32_t now_ms = hal.get_elapsed_ticks();
+        if(now_ms - wedge_dbg_last_ms > 2000) {
+            wedge_dbg_last_ms = now_ms;
+            wedge_dbg_dump_ring(rxbuffer, "line too long, truncating");
+        }
+    }
 
     return true;
 }
