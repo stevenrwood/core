@@ -613,6 +613,19 @@ bool protocol_exec_rt_system (void)
         // Execute system abort.
         if((sys.reset_pending = bit_istrue(rt_exec, EXEC_RESET))) {
 
+            // WEDGE-DBG (2026-07, temporary): count how many times THIS branch sees EXEC_RESET true,
+            // separate from mc_reset()'s own fire-count (motion_control.c) - the only two known setters
+            // of EXEC_RESET are mc_reset() and one spindle-sync-gated site in state_machine.c. If this
+            // counter climbs faster than mc_reset()'s, EXEC_RESET is being read as true more often than
+            // it's being freshly set, pointing at either a stale/uncleared flag or an unfound setter.
+            // See ioSender-side memory iosender-streamer-thread.md.
+            {
+                static uint32_t wedge_dbg_reset_branch_count = 0;
+                hal.stream.write_all("[MSG:WEDGE-DBG reset-branch hit, count=");
+                hal.stream.write_all(uitoa(++wedge_dbg_reset_branch_count));
+                hal.stream.write_all("]" ASCII_EOL);
+            }
+
             if(!killed) {
                 // Kill spindle and coolant.
                 spindle_all_off(true);

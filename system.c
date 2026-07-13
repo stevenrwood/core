@@ -451,11 +451,22 @@ FLASHMEM static status_code_t disable_lock (sys_state_t state, char *args)
     if(state & (STATE_ALARM|STATE_ESTOP)) {
 
         if((retval = check_status(false)) == Status_OK) {
+            // WEDGE-DBG (2026-07, temporary): $X's own handler, at the exact moment it decides what
+            // to do - shows whether check_status() succeeded and whether a pending alarm is about to
+            // be re-raised (the only two branches here). See ioSender-side memory
+            // iosender-streamer-thread.md.
+            hal.stream.write_all("[MSG:WEDGE-DBG disable_lock: check_status=OK, alarm_pending=");
+            hal.stream.write_all(uitoa((uint32_t)sys.alarm_pending));
+            hal.stream.write_all("]" ASCII_EOL);
             state_set(STATE_IDLE);
             if(sys.alarm_pending)
                 system_raise_alarm(sys.alarm_pending);
             else
                 grbl.report.feedback_message(Message_AlarmUnlock);
+        } else {
+            hal.stream.write_all("[MSG:WEDGE-DBG disable_lock: check_status=");
+            hal.stream.write_all(uitoa((uint32_t)retval));
+            hal.stream.write_all("]" ASCII_EOL);
         }
         // Don't run startup script. Prevents stored moves in startup from causing accidents.
     } // Otherwise, no effect.
