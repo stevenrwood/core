@@ -484,6 +484,14 @@ FLASHMEM int grbl_enter (void)
 
         // Reset primary systems.
         hal.stream.reset_read_buffer();                 // Clear input stream buffer
+        // WEDGE-DBG (2026-07, part of the fix): reset_write_buffer was defined in the HAL interface
+        // (optional, "Required for Modbus/RS-485 support") and even implemented by telnetd.c, but never
+        // called anywhere in this reboot sequence on ANY transport - so a stale, partially-transmitted
+        // TX message from before the reset could leak out merged with this reboot's own output, with no
+        // separator. Observed as a garbled/concatenated "ALARM:" line following a Reset-during-motion
+        // repro, on both Serial and Telnet (see ioSender-side memory iosender-streamer-thread.md).
+        if(hal.stream.reset_write_buffer)
+            hal.stream.reset_write_buffer();            // Clear output stream buffer
         gc_init(settings.flags.keep_offsets_on_reset);  // Set g-code parser to default state
         hal.limits.enable(settings.limits.flags.hard_enabled, (axes_signals_t){0});
         plan_reset();                                   // Clear block buffer and planner variables
