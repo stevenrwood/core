@@ -384,9 +384,22 @@ bool protocol_main_loop (void)
         // Handle extra command (internal stream)
         if(xcommand[0] != '\0') {
 
-            if (xcommand[0] == '$') // grblHAL '$' system command
-                system_execute_line(xcommand);
-            else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
+            if (xcommand[0] == '$') { // grblHAL '$' system command
+                // WEDGE-DBG (2026-07, temporary): mirrors the main-line '$'-dispatch trace above - this
+                // is the OTHER '$' dispatch site (the internal/secondary "xcommand" injection path,
+                // distinct from the normal per-character input path) and was the one asymmetric gap
+                // left in the read-to-dispatch coverage: every other silent branch here ends in a
+                // normal ok/error/alarm reply already visible in ioSender's console.log, but this path
+                // previously had no trace of its own. See ioSender-side memory
+                // iosender-streamer-thread.md.
+                hal.stream.write_all("[MSG:WEDGE-DBG dispatching '$' (xcommand) line=\"");
+                hal.stream.write_all(xcommand);
+                hal.stream.write_all("\"]" ASCII_EOL);
+                status_code_t wedge_dbg_xresult = system_execute_line(xcommand);
+                hal.stream.write_all("[MSG:WEDGE-DBG '$' (xcommand) dispatch result=");
+                hal.stream.write_all(uitoa((uint32_t)wedge_dbg_xresult));
+                hal.stream.write_all("]" ASCII_EOL);
+            } else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
                 grbl.report.status_message(Status_SystemGClock);
             else // Parse and execute g-code block.
                 gc_execute_block(xcommand);
