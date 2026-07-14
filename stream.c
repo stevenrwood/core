@@ -276,6 +276,34 @@ int32_t stream_rx_linebuffer_get (stream_rx_linebuffer_t *rxbuffer)
     if(rxbuffer->tail == rxbuffer->head)
         return SERIAL_NO_DATA; // no completed line queued
 
+    // WEDGE-DBG (2026-07, temporary): throttled (1/sec) raw ring-state dump, fires only when real
+    // (non-empty) data is about to be returned - the flush()/cancel() critical-section fix didn't
+    // resolve the runaway spin (same signature: tens of millions of reads/sec, same 2 phantom bytes,
+    // forever), so this gets the ACTUAL head/tail/rpos/len/backup state instead of more guessing.
+    // See ioSender-side memory iosender-streamer-thread.md.
+    {
+        static uint32_t wedge_dbg_last_ms = 0;
+        uint32_t now_ms = hal.get_elapsed_ticks();
+        if(now_ms - wedge_dbg_last_ms >= 1000) {
+            wedge_dbg_last_ms = now_ms;
+            hal.stream.write_all("[MSG:WEDGE-DBG ring state: head=");
+            hal.stream.write_all(uitoa(rxbuffer->head));
+            hal.stream.write_all(" tail=");
+            hal.stream.write_all(uitoa(rxbuffer->tail));
+            hal.stream.write_all(" rpos=");
+            hal.stream.write_all(uitoa(rxbuffer->rpos));
+            hal.stream.write_all(" len[head]=");
+            hal.stream.write_all(uitoa(rxbuffer->len[rxbuffer->head]));
+            hal.stream.write_all(" len[tail]=");
+            hal.stream.write_all(uitoa(rxbuffer->len[rxbuffer->tail]));
+            hal.stream.write_all(" overflow=");
+            hal.stream.write_all(rxbuffer->overflow ? "1" : "0");
+            hal.stream.write_all(" backup=");
+            hal.stream.write_all(rxbuffer->backup ? "1" : "0");
+            hal.stream.write_all("]" ASCII_EOL);
+        }
+    }
+
     int32_t c = (int32_t)(uint8_t)rxbuffer->data[rxbuffer->tail][rxbuffer->rpos++];
 
     if(rxbuffer->rpos >= rxbuffer->len[rxbuffer->tail]) {
