@@ -540,6 +540,12 @@ FLASHMEM int grbl_enter (void)
         // Print welcome message. Indicates an initialization has occurred at power-up or with a reset.
         grbl.report.init_message(hal.stream.write_all);
 
+        // WEDGE-DBG (2026-07, temporary): surface Teensyduino's CrashReport (if a real CPU fault
+        // wrote one) right after the boot banner - see usb_serial_ard.cpp for why. No-ops silently
+        // when there's nothing to report (CRC-invalid/cleared), so safe on every ordinary reboot.
+        extern void wedge_dbg_report_crash(void);
+        wedge_dbg_report_crash();
+
         if(!settings.flags.no_unlock_after_estop && state_get() == STATE_ESTOP)
             state_set(STATE_ALARM);
 
