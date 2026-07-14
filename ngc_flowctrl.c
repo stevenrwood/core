@@ -329,8 +329,11 @@ FLASHMEM static void stack_unwind_sub (uint32_t o_label)
 FLASHMEM void ngc_flowctrl_unwind_stack (vfs_file_t *file)
 {
     clear_subs(file);
-    while(stack_idx >= 0 && stack[stack_idx].file == file)
+    while(stack_idx >= 0 && stack[stack_idx].file == file) {
+        if(stack[stack_idx].o_label > NGC_MAX_PARAM_ID)
+            stream_redirect_close(stack[stack_idx].file);
         stack_pull();
+    }
 }
 
 FLASHMEM static status_code_t onGcodeComment (char *comment)
@@ -366,20 +369,13 @@ FLASHMEM void ngc_flowctrl_init (void)
     }
 
     clear_subs(NULL);
-    // WEDGE-DBG (2026-07): this reset-time unwind previously just called stack_pull() for every
-    // entry, which clears the stack's OWN bookkeeping but never calls stream_redirect_close() - unlike
-    // stack_unwind_sub() below, which does exactly that for named-subroutine entries (o_label >
-    // NGC_MAX_PARAM_ID, i.e. entries that actually opened a file via stream_redirect_read()). If a
-    // Reset landed while a named O-call (e.g. a Start Job macro file) was active, hal.stream.read
-    // stayed permanently stuck on stream_read_file (stream_file.c) - explaining a self-sustaining
-    // phantom-data loop needing no real ISR/network traffic, confirmed via the read_fn address print
-    // resolving to stream_read_file in the last repro. See ioSender-side memory
-    // iosender-streamer-thread.md.
+    // Close any still-open named-subroutine file redirect before dropping this stack entry - a Reset
+    // landing mid-O-call previously left hal.stream.read permanently stuck on the file reader
+    // (stream_file.c's stream_read_file), since this loop only cleared the stack's own bookkeeping.
+    // Mirrors stack_unwind_sub()'s handling of the same entry kind.
     while(stack_idx >= 0) {
-        if(stack[stack_idx].o_label > NGC_MAX_PARAM_ID) {
-            hal.stream.write_all("[MSG:WEDGE-DBG ngc_flowctrl_init: closing leaked named-sub redirect]" ASCII_EOL);
+        if(stack[stack_idx].o_label > NGC_MAX_PARAM_ID)
             stream_redirect_close(stack[stack_idx].file);
-        }
         stack_pull();
     }
 }

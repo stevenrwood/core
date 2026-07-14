@@ -35,14 +35,11 @@
 #endif
 #endif
 
-// WEDGE-DBG (2026-07): these backup slots used to be FULL stream_rx_buffer_t/stream_rx_linebuffer_t
-// copies - up to 16KB for the line-ring version, almost entirely the raw data[][] payload - even
-// though that payload never moves; only the bookkeeping describing where to find it does. That made
-// the tool-change-ack backup/restore memcpy() big, slow, and entirely unprotected against a
-// concurrent ISR write (network RX for Telnet) - a torn 16KB copy racing an interrupt is a much
-// bigger window than the flush()/cancel() race fixed earlier (which did NOT resolve the reset-wedge
-// investigation's runaway ring spin). Shrunk to bookkeeping-only shadow structs, now cheap enough to
-// copy inside a proper critical section. See ioSender-side memory iosender-streamer-thread.md.
+// Bookkeeping-only backup slots for the tool-change-ack suspend/resume: these used to be full
+// stream_rx_buffer_t/stream_rx_linebuffer_t copies (up to ~16.5KB for the line-ring version, almost
+// entirely the raw data[][] payload) even though that payload never moves - only the bookkeeping
+// describing where to find it does. Shrunk so the restore-side copy is cheap enough to wrap in a
+// proper critical section (see stream_rx_suspend/stream_rx_linebuffer_suspend below).
 typedef struct {
     uint_fast16_t head;
     uint_fast16_t tail;
@@ -189,7 +186,6 @@ FLASHMEM const io_stream_status_t *stream_get_uart_status (uint8_t instance)
 ISR_CODE static bool ISR_FUNC(await_toolchange_ack)(uint8_t c)
 {
     if(c == CMD_TOOL_ACK && !stream.rxbuffer->backup) {
-        // WEDGE-DBG (2026-07): only the bookkeeping needs saving - see rxbackup's declaration above.
         rxbackup.head = stream.rxbuffer->head;
         rxbackup.tail = stream.rxbuffer->tail;
         rxbackup.rts_state = stream.rxbuffer->rts_state;
@@ -231,9 +227,7 @@ FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
         }
     } else if((ok = stream.rxbuffer)) {
         if(rxbuffer->backup) {
-            // WEDGE-DBG (2026-07): restore only the bookkeeping (see rxbackup's declaration above) -
-            // critical section so this can't race the ISR-side backup in await_toolchange_ack() above,
-            // now cheap enough (a few bytes) that disabling interrupts for it is a non-issue.
+            // Critical section so this can't race the ISR-side backup in await_toolchange_ack() above.
             hal.irq_disable();
             rxbuffer->head = rxbackup.head;
             rxbuffer->tail = rxbackup.tail;
@@ -255,34 +249,6 @@ FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
 
 // --- line-ring RX buffer (stream_rx_linebuffer_t) - see stream.h for the design rationale ---
 
-// WEDGE-DBG (2026-07, temporary): the ring-state dump inside stream_rx_linebuffer_get() below
-// stopped appearing entirely after a reboot in the last repro, while protocol.c's "inner-loop alive"
-// heartbeat (same 1-second throttle idiom, different function) kept firing reliably the whole time.
-// Since write_all() calls are already known to be swallowed in this failure state (see the bail-point
-// counters), that alone doesn't prove stream_rx_linebuffer_get() isn't being called - a plain counter,
-// reported via protocol.c's already-reliable channel instead of its own write, settles it either way.
-// Non-static: read from protocol.c via extern.
-volatile uint32_t wedge_dbg_get_real_count = 0;
-
-// WEDGE-DBG (2026-07, temporary): print raw ring state whenever this function does something
-// anomalous (rejects a terminator because the ring is full, or truncates an over-length line).
-// These are the two ways a line can be silently lost/corrupted from here - see protocol.c's own
-// WEDGE-DBG block for the wider investigation this belongs to.
-static void wedge_dbg_dump_ring (stream_rx_linebuffer_t *rxbuffer, const char *why)
-{
-    hal.stream.write_all("[MSG:WEDGE-DBG linebuf ");
-    hal.stream.write_all(why);
-    hal.stream.write_all(" head=");
-    hal.stream.write_all(uitoa(rxbuffer->head));
-    hal.stream.write_all(" tail=");
-    hal.stream.write_all(uitoa(rxbuffer->tail));
-    hal.stream.write_all(" rpos=");
-    hal.stream.write_all(uitoa(rxbuffer->rpos));
-    hal.stream.write_all(" len[head]=");
-    hal.stream.write_all(uitoa(rxbuffer->len[rxbuffer->head]));
-    hal.stream.write_all("]" ASCII_EOL);
-}
-
 bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
 {
     bool is_eol = c == ASCII_LF || c == ASCII_CR;
@@ -292,7 +258,6 @@ bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
         uint_fast8_t next_head = LINEBUFNEXT(rxbuffer->head);
         if(next_head == rxbuffer->tail) {
             rxbuffer->overflow = true; // ring full - reject, caller should retry this same character later
-            wedge_dbg_dump_ring(rxbuffer, "terminator rejected, ring full");
             return false;
         }
         if(n < RX_LINE_LENGTH)
@@ -302,17 +267,8 @@ bool stream_rx_linebuffer_put (stream_rx_linebuffer_t *rxbuffer, char c)
     } else if(n < RX_LINE_LENGTH) {
         rxbuffer->data[rxbuffer->head][n++] = c;
         rxbuffer->len[rxbuffer->head] = n;
-    } else {
+    } else
         rxbuffer->overflow = true; // line too long, drop the excess but keep scanning for the terminator
-        // WEDGE-DBG: len[head] pins at RX_LINE_LENGTH once truncation starts (never increments further),
-        // so gate on elapsed time rather than a byte count to avoid flooding on a long excess run.
-        static uint32_t wedge_dbg_last_ms = 0;
-        uint32_t now_ms = hal.get_elapsed_ticks();
-        if(now_ms - wedge_dbg_last_ms > 2000) {
-            wedge_dbg_last_ms = now_ms;
-            wedge_dbg_dump_ring(rxbuffer, "line too long, truncating");
-        }
-    }
 
     return true;
 }
@@ -321,36 +277,6 @@ int32_t stream_rx_linebuffer_get (stream_rx_linebuffer_t *rxbuffer)
 {
     if(rxbuffer->tail == rxbuffer->head)
         return SERIAL_NO_DATA; // no completed line queued
-
-    wedge_dbg_get_real_count++; // WEDGE-DBG: see protocol.c's "inner-loop alive" print
-
-    // WEDGE-DBG (2026-07, temporary): throttled (1/sec) raw ring-state dump, fires only when real
-    // (non-empty) data is about to be returned - the flush()/cancel() critical-section fix didn't
-    // resolve the runaway spin (same signature: tens of millions of reads/sec, same 2 phantom bytes,
-    // forever), so this gets the ACTUAL head/tail/rpos/len/backup state instead of more guessing.
-    // See ioSender-side memory iosender-streamer-thread.md.
-    {
-        static uint32_t wedge_dbg_last_ms = 0;
-        uint32_t now_ms = hal.get_elapsed_ticks();
-        if(now_ms - wedge_dbg_last_ms >= 1000) {
-            wedge_dbg_last_ms = now_ms;
-            hal.stream.write_all("[MSG:WEDGE-DBG ring state: head=");
-            hal.stream.write_all(uitoa(rxbuffer->head));
-            hal.stream.write_all(" tail=");
-            hal.stream.write_all(uitoa(rxbuffer->tail));
-            hal.stream.write_all(" rpos=");
-            hal.stream.write_all(uitoa(rxbuffer->rpos));
-            hal.stream.write_all(" len[head]=");
-            hal.stream.write_all(uitoa(rxbuffer->len[rxbuffer->head]));
-            hal.stream.write_all(" len[tail]=");
-            hal.stream.write_all(uitoa(rxbuffer->len[rxbuffer->tail]));
-            hal.stream.write_all(" overflow=");
-            hal.stream.write_all(rxbuffer->overflow ? "1" : "0");
-            hal.stream.write_all(" backup=");
-            hal.stream.write_all(rxbuffer->backup ? "1" : "0");
-            hal.stream.write_all("]" ASCII_EOL);
-        }
-    }
 
     int32_t c = (int32_t)(uint8_t)rxbuffer->data[rxbuffer->tail][rxbuffer->rpos++];
 
@@ -383,14 +309,10 @@ void stream_rx_linebuffer_flush (stream_rx_linebuffer_t *rxbuffer)
 {
     uint_fast8_t i;
 
-    // WEDGE-DBG (2026-07): this runs on the foreground thread (grbl_enter()'s reinit loop on every
-    // Reset, and protocol.c's blocking_event handler), while stream_rx_linebuffer_put() can be
-    // called from a genuine interrupt context (lwIP's tcp_recv, driven by the Ethernet RX interrupt
-    // chain, for Telnet). With no critical section here, a concurrent put() mid-loop could leave
-    // head/tail/len[] torn/inconsistent. Matches the observed symptom exactly: a permanent,
-    // self-sustaining "always more data" spin inside stream_rx_linebuffer_get() with zero new bytes
-    // ever actually arriving (tens of millions of phantom reads/sec, forever, only clearable by a
-    // power-cycle). See ioSender-side memory iosender-streamer-thread.md.
+    // Critical section: this runs on the foreground thread (grbl_enter()'s reinit loop on every
+    // Reset, and protocol.c's blocking_event handler), while stream_rx_linebuffer_put() can be called
+    // from a genuine interrupt context (lwIP's tcp_recv, driven by the Ethernet RX interrupt chain,
+    // for Telnet) - without this, a concurrent put() mid-loop could leave head/tail/len[] torn.
     hal.irq_disable();
 
     for(i = 0; i < RX_LINE_BUFFERS; i++)
@@ -406,9 +328,9 @@ void stream_rx_linebuffer_cancel (stream_rx_linebuffer_t *rxbuffer)
 {
     uint_fast8_t i;
 
-    // WEDGE-DBG (2026-07): inlines the flush (rather than calling stream_rx_linebuffer_flush()) so
-    // the whole operation - clear plus the CAN-marker write below - runs in ONE critical section, not
-    // two back to back with an unprotected gap between them. Same race as flush() above.
+    // Inlines the flush (rather than calling stream_rx_linebuffer_flush()) so the whole operation -
+    // clear plus the CAN-marker write below - runs in ONE critical section, not two back to back with
+    // an unprotected gap between them. Same race as flush() above.
     hal.irq_disable();
 
     for(i = 0; i < RX_LINE_BUFFERS; i++)
@@ -426,15 +348,13 @@ void stream_rx_linebuffer_cancel (stream_rx_linebuffer_t *rxbuffer)
 ISR_CODE static bool ISR_FUNC(await_toolchange_ack_linebuffer)(uint8_t c)
 {
     if(c == CMD_TOOL_ACK && !linestream.rxbuffer->backup) {
-        // WEDGE-DBG (2026-07): only the bookkeeping needs saving, NOT the 16KB data[][] payload - see
-        // linerxbackup's declaration above.
-        uint_fast8_t wedge_dbg_i;
+        uint_fast8_t i;
         linerxbackup.head = linestream.rxbuffer->head;
         linerxbackup.tail = linestream.rxbuffer->tail;
         linerxbackup.rpos = linestream.rxbuffer->rpos;
         linerxbackup.overflow = linestream.rxbuffer->overflow;
-        for(wedge_dbg_i = 0; wedge_dbg_i < RX_LINE_BUFFERS; wedge_dbg_i++)
-            linerxbackup.len[wedge_dbg_i] = linestream.rxbuffer->len[wedge_dbg_i];
+        for(i = 0; i < RX_LINE_BUFFERS; i++)
+            linerxbackup.len[i] = linestream.rxbuffer->len[i];
         linestream.rxbuffer->backup = true;
         linestream.rxbuffer->tail = linestream.rxbuffer->head;
         hal.stream.read = linestream.read; // restore normal input
@@ -461,17 +381,16 @@ FLASHMEM bool stream_rx_linebuffer_suspend (stream_rx_linebuffer_t *rxbuffer, bo
         }
     } else if((ok = linestream.rxbuffer != NULL)) {
         if(rxbuffer->backup) {
-            // WEDGE-DBG (2026-07): restore only the bookkeeping - critical section so this can't race
-            // the ISR-side backup in await_toolchange_ack_linebuffer() above. Now a few hundred bytes
-            // instead of 16KB, so disabling interrupts for it is a non-issue.
-            uint_fast8_t wedge_dbg_i;
+            // Critical section so this can't race the ISR-side backup in
+            // await_toolchange_ack_linebuffer() above.
+            uint_fast8_t i;
             hal.irq_disable();
             rxbuffer->head = linerxbackup.head;
             rxbuffer->tail = linerxbackup.tail;
             rxbuffer->rpos = linerxbackup.rpos;
             rxbuffer->overflow = linerxbackup.overflow;
-            for(wedge_dbg_i = 0; wedge_dbg_i < RX_LINE_BUFFERS; wedge_dbg_i++)
-                rxbuffer->len[wedge_dbg_i] = linerxbackup.len[wedge_dbg_i];
+            for(i = 0; i < RX_LINE_BUFFERS; i++)
+                rxbuffer->len[i] = linerxbackup.len[i];
             rxbuffer->backup = false;
             hal.irq_enable();
         }
@@ -612,19 +531,6 @@ FLASHMEM void stream_usb_linestate_changed (uint8_t instance, serial_linestate_t
 FLASHMEM static bool stream_select (const io_stream_t *stream, bool add)
 {
     static const io_stream_t *active_stream = NULL;
-
-    // WEDGE-DBG (2026-07, temporary): every call, regardless of stream type or add/remove - this is
-    // the entry point for stream_connect()/stream_disconnect(), one of which runs whenever a new
-    // Telnet client connects (telnetd.c) or the USB serial link is (re)established. See ioSender-side
-    // memory iosender-streamer-thread.md. GUARDED: hal.stream.write_all is not yet assigned on the
-    // very first call (initial driver setup calls this before hal.stream is fully populated) -
-    // calling through it unconditionally here crashed/hung the boot entirely (confirmed - this broke
-    // both Serial and Telnet connectivity outright).
-    if(hal.stream.write_all) {
-        hal.stream.write_all("[MSG:WEDGE-DBG stream_select: type=");
-        hal.stream.write_all(uitoa((uint32_t)stream->type));
-        hal.stream.write_all(add ? " add=1]" ASCII_EOL : " add=0]" ASCII_EOL);
-    }
 
     bool send_init_message = false, mpg_enable = false;
 

@@ -57,25 +57,6 @@ static char xcommand[LINE_BUFFER_SIZE];
 static bool keep_rt_commands = false;
 static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see protocol_main_loop
 
-// WEDGE-DBG (2026-07, temporary): instrumentation for the "Reset/Feed-Hold/Stop wedges the controller,
-// only a power-cycle clears it" investigation (see ioSender-side memory iosender-streamer-thread.md,
-// "Reproduced 5x across 3 triggers"). Print-only, no behavior change - remove once root-caused, or
-// promote to permanent (behind a $-setting or debug build flag) if it proves its worth.
-static volatile bool wedge_dbg_reset_blocked_estop = false; // set in ISR, see protocol_enqueue_realtime_command
-static bool wedge_dbg_stop_wait_logged = false;             // one-shot guard, EXEC_STOP wait-for-stop loop
-static volatile uint32_t wedge_dbg_cmd_stop_count = 0;      // set in ISR, see CMD_STOP case below
-
-// WEDGE-DBG: counters for protocol_main_loop()'s only two return points (verified by enumerating
-// every `return` in the function - there is no third). A prior repro showed NEITHER of these two
-// bail points' own write_all() prints ever fired, not even for a confirmed-legitimate Reset - most
-// likely because those writes happen BEFORE grbl_enter()'s reinit loop runs
-// hal.stream.reset_write_buffer(), so if the stream's TX state is already compromised at that exact
-// moment, the bytes are lost silently. These counters can't be swallowed the same way (no write
-// involved at the increment site) and are reported from grbllib.c's already-proven-reliable
-// per-reboot print, alongside "reboot count=". Non-static: read from grbllib.c via extern.
-volatile uint32_t wedge_dbg_bail_line_count = 0;   // the per-line checkpoint (~protocol_execute_realtime() false)
-volatile uint32_t wedge_dbg_bail_outer_count = 0;  // the per-outer-loop-iteration checkpoint
-
 static void protocol_exec_rt_suspend (sys_state_t state);
 
 // add gcode to execute not originating from normal input stream
@@ -229,46 +210,6 @@ bool protocol_main_loop (void)
         // initial filtering by removing leading spaces and control characters.
         while((c = hal.stream.read()) != SERIAL_NO_DATA) {
 
-            // WEDGE-DBG (2026-07, temporary): throttled (1/sec, by wall-clock, not by character
-            // count) liveness sample INSIDE the inner read loop, gated to STATE_ALARM. The
-            // outer-loop heartbeat (below, after this inner loop) never fired even once across an
-            // 18s stuck-alarm window with 3 separate $X attempts - i.e. execution never reaches
-            // that point. This checks the remaining hypothesis: hal.stream.read() never returns
-            // SERIAL_NO_DATA again after the reboot, so the inner loop itself never exits. Safe even
-            // if this loop is genuinely spinning at full speed, since the print is time-gated, not
-            // per-iteration. If even THIS never appears, hal.stream.read() itself is not returning
-            // at all (blocked in the HAL/driver layer), not just looping in C. See ioSender-side
-            // memory iosender-streamer-thread.md.
-            if(state_get() & STATE_ALARM) {
-                static uint32_t wedge_dbg_last_inner = 0;
-                static uint32_t wedge_dbg_inner_reads = 0;
-                wedge_dbg_inner_reads++;
-                uint32_t wedge_dbg_now = hal.get_elapsed_ticks();
-                if(wedge_dbg_now - wedge_dbg_last_inner >= 1000) {
-                    wedge_dbg_last_inner = wedge_dbg_now;
-                    // WEDGE-DBG: cross-check against stream_rx_linebuffer_get()'s own real-data
-                    // counter (stream.c) - if this stays far below wedge_dbg_inner_reads, the phantom
-                    // data isn't coming from that function at all (hal.stream.read points elsewhere).
-                    extern volatile uint32_t wedge_dbg_get_real_count;
-                    // WEDGE-DBG: get_real ruled out stream_rx_linebuffer_get() as the source, and
-                    // fs_stream.c/macros.c's file-redirect traces never fired either (neither macro
-                    // subsystem was engaged) - so print the RAW ADDRESS of hal.stream.read itself.
-                    // Look it up in firmware.elf afterward (arm-none-eabi-nm/addr2line) for a
-                    // definitive answer instead of guessing at more candidate functions.
-                    hal.stream.write_all("[MSG:WEDGE-DBG inner-loop alive, tick=");
-                    hal.stream.write_all(uitoa(wedge_dbg_now));
-                    hal.stream.write_all(" reads=");
-                    hal.stream.write_all(uitoa(wedge_dbg_inner_reads));
-                    hal.stream.write_all(" get_real=");
-                    hal.stream.write_all(uitoa(wedge_dbg_get_real_count));
-                    hal.stream.write_all(" read_fn="); // decimal address (uitoa has no hex mode) - convert offline
-                    hal.stream.write_all(uitoa((uint32_t)(uintptr_t)hal.stream.read));
-                    hal.stream.write_all(" last_c=");
-                    hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
-                    hal.stream.write_all("]" ASCII_EOL);
-                }
-            }
-
             if(c == ASCII_CAN) {
 
                 eol = xcommand[0] = '\0';
@@ -292,27 +233,8 @@ bool protocol_main_loop (void)
                 } else
                     eol = (char)c;
 
-                if(!protocol_execute_realtime()) { // Runtime command check point.
-                    wedge_dbg_bail_line_count++; // WEDGE-DBG: see grbllib.c's reboot report
-                    // WEDGE-DBG (2026-07, temporary): this bail path re-enters the FULL reboot cycle
-                    // WITHOUT going through mc_reset() - confirmed via the mc_reset/reboot counters
-                    // (motion_control.c/grbllib.c) staying out of sync during a repro. Print exactly
-                    // why: sys.abort/sys.cancel (the two ABORTED bits, nuts_bolts.h), rt_exec_state,
-                    // and the accumulated line buffer (the line that triggered this bail, if any -
-                    // catches a corrupted/embedded stray byte). See ioSender-side memory
-                    // iosender-streamer-thread.md for the investigation this belongs to.
-                    hal.stream.write_all("[MSG:WEDGE-DBG bail: abort=");
-                    hal.stream.write_all(sys.abort ? "1" : "0");
-                    hal.stream.write_all(" cancel=");
-                    hal.stream.write_all(sys.cancel ? "1" : "0");
-                    hal.stream.write_all(" rt_exec_state=");
-                    hal.stream.write_all(uitoa((uint32_t)sys.rt_exec_state));
-                    hal.stream.write_all(" line=\"");
-                    line[char_counter] = '\0';
-                    hal.stream.write_all(line);
-                    hal.stream.write_all("\"]" ASCII_EOL);
+                if(!protocol_execute_realtime()) // Runtime command check point.
                     return !sys.flags.exit;      // Bail to calling function upon system abort
-                }
 
                 line[char_counter] = '\0'; // Set string termination character.
 
@@ -338,19 +260,7 @@ bool protocol_main_loop (void)
                     hal.stream.write("]" ASCII_EOL);
                     gc_state.last_error = Status_OK;
                 } else if(*line == '$') {// grblHAL '$' system command
-                    // WEDGE-DBG (2026-07, temporary): trace every '$'-command dispatch and its result
-                    // code - confirms whether $X is actually reaching system_execute_line() at all,
-                    // since neither disable_lock() nor any of the alarm-reraise paths have been seen
-                    // to fire despite $X visibly failing to unlock every time. See ioSender-side
-                    // memory iosender-streamer-thread.md.
-                    hal.stream.write_all("[MSG:WEDGE-DBG dispatching '$' line=\"");
-                    hal.stream.write_all(line);
-                    hal.stream.write_all("\"]" ASCII_EOL);
-                    gc_state.last_error = system_execute_line(line);
-                    hal.stream.write_all("[MSG:WEDGE-DBG '$' dispatch result=");
-                    hal.stream.write_all(uitoa((uint32_t)gc_state.last_error));
-                    hal.stream.write_all("]" ASCII_EOL);
-                    if(gc_state.last_error == Status_LimitsEngaged) {
+                    if((gc_state.last_error = system_execute_line(line)) == Status_LimitsEngaged) {
                         system_raise_alarm(Alarm_LimitsEngaged);
                         grbl.report.feedback_message(Message_CheckLimits);
                     }
@@ -436,22 +346,9 @@ bool protocol_main_loop (void)
         // Handle extra command (internal stream)
         if(xcommand[0] != '\0') {
 
-            if (xcommand[0] == '$') { // grblHAL '$' system command
-                // WEDGE-DBG (2026-07, temporary): mirrors the main-line '$'-dispatch trace above - this
-                // is the OTHER '$' dispatch site (the internal/secondary "xcommand" injection path,
-                // distinct from the normal per-character input path) and was the one asymmetric gap
-                // left in the read-to-dispatch coverage: every other silent branch here ends in a
-                // normal ok/error/alarm reply already visible in ioSender's console.log, but this path
-                // previously had no trace of its own. See ioSender-side memory
-                // iosender-streamer-thread.md.
-                hal.stream.write_all("[MSG:WEDGE-DBG dispatching '$' (xcommand) line=\"");
-                hal.stream.write_all(xcommand);
-                hal.stream.write_all("\"]" ASCII_EOL);
-                status_code_t wedge_dbg_xresult = system_execute_line(xcommand);
-                hal.stream.write_all("[MSG:WEDGE-DBG '$' (xcommand) dispatch result=");
-                hal.stream.write_all(uitoa((uint32_t)wedge_dbg_xresult));
-                hal.stream.write_all("]" ASCII_EOL);
-            } else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
+            if (xcommand[0] == '$') // grblHAL '$' system command
+                system_execute_line(xcommand);
+            else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
                 grbl.report.status_message(Status_SystemGClock);
             else // Parse and execute g-code block.
                 gc_execute_block(xcommand);
@@ -464,41 +361,8 @@ bool protocol_main_loop (void)
         // completed. In either case, auto-cycle start, if enabled, any queued moves.
         protocol_auto_cycle_start();
 
-        // WEDGE-DBG (2026-07, temporary): throttled liveness heartbeat for the outer while(true)
-        // loop, gated to STATE_ALARM (silent during normal job streaming - no flood risk). Placed
-        // BEFORE protocol_execute_realtime() below so it still fires even if that call turns out to
-        // block/spin. Combined with the per-character alarm-state trace above: if this heartbeat
-        // keeps printing but no char-read trace ever appears despite the RX-free byte count visibly
-        // draining (status reports), the outer loop is alive and calling hal.stream.read() every
-        // iteration, but read() itself never sees the pending bytes - points at the stream/driver
-        // layer, not this loop. If this heartbeat stops appearing entirely, the loop itself got stuck
-        // (most likely inside protocol_execute_realtime(), called right after this). See ioSender-side
-        // memory iosender-streamer-thread.md.
-        if(state_get() & STATE_ALARM) {
-            static uint32_t wedge_dbg_last_heartbeat = 0;
-            uint32_t wedge_dbg_now = hal.get_elapsed_ticks();
-            if(wedge_dbg_now - wedge_dbg_last_heartbeat >= 1000) {
-                wedge_dbg_last_heartbeat = wedge_dbg_now;
-                hal.stream.write_all("[MSG:WEDGE-DBG alarm-loop alive, tick=");
-                hal.stream.write_all(uitoa(wedge_dbg_now));
-                hal.stream.write_all("]" ASCII_EOL);
-            }
-        }
-
-        if(!protocol_execute_realtime() && sys.abort) { // Runtime command check point.
-            wedge_dbg_bail_outer_count++; // WEDGE-DBG: see grbllib.c's reboot report
-            // WEDGE-DBG (2026-07, temporary): the OTHER bail checkpoint (distinct from the per-line
-            // one already instrumented above) - runs once per outer while(true) iteration, after all
-            // currently-available characters are drained. If this is what's firing for the mystery
-            // reboot, sys.abort must be true here - see ioSender-side memory
-            // iosender-streamer-thread.md.
-            hal.stream.write_all("[MSG:WEDGE-DBG outer-loop bail: abort=1 cancel=");
-            hal.stream.write_all(sys.cancel ? "1" : "0");
-            hal.stream.write_all(" rt_exec_state=");
-            hal.stream.write_all(uitoa((uint32_t)sys.rt_exec_state));
-            hal.stream.write_all("]" ASCII_EOL);
+        if(!protocol_execute_realtime() && sys.abort) // Runtime command check point.
             return !sys.flags.exit;                   // Bail to main() program loop to reset system.
-        }
 
         sys.cancel = false;
 
@@ -597,45 +461,6 @@ bool protocol_exec_rt_system (void)
     rt_exec_t rt_exec;
     bool killed = false;
 
-    // WEDGE-DBG: report a Reset that the ISR silently dropped because e_stop read asserted at that
-    // instant - see the CMD_RESET case in protocol_enqueue_realtime_command. Reported here (main-loop
-    // context) rather than in the ISR. One-shot per assertion so a stuck/latched e_stop input doesn't
-    // flood the log if the user presses Reset repeatedly while it's stuck.
-    if(wedge_dbg_reset_blocked_estop) {
-        wedge_dbg_reset_blocked_estop = false;
-        hal.stream.write_all("[MSG:WEDGE-DBG Reset ignored - e_stop input reads asserted]" ASCII_EOL);
-    }
-
-    // WEDGE-DBG: report every increment of mc_reset()'s own fire-count (motion_control.c) - if this
-    // climbs more than once per an actual physical Reset press, the controller is re-triggering its
-    // own reset internally without user action.
-    {
-        extern volatile uint32_t wedge_dbg_mc_reset_count;
-        static uint32_t wedge_dbg_last_seen = 0;
-        uint32_t now = wedge_dbg_mc_reset_count;
-        if(now != wedge_dbg_last_seen) {
-            wedge_dbg_last_seen = now;
-            hal.stream.write_all("[MSG:WEDGE-DBG mc_reset fired, count=");
-            hal.stream.write_all(uitoa(now));
-            hal.stream.write_all("]" ASCII_EOL);
-        }
-    }
-
-    // WEDGE-DBG: report every increment of the CMD_STOP realtime-byte counter (this file, ISR case
-    // above) - the only known direct setter of EXEC_STOP. If EXEC_STOP ends up processed (see the
-    // "EXEC_STOP branch: re-raising alarm_pending" print) without this counter climbing, EXEC_STOP
-    // is being set from somewhere not yet found.
-    {
-        static uint32_t wedge_dbg_last_seen = 0;
-        uint32_t now = wedge_dbg_cmd_stop_count;
-        if(now != wedge_dbg_last_seen) {
-            wedge_dbg_last_seen = now;
-            hal.stream.write_all("[MSG:WEDGE-DBG CMD_STOP byte seen, count=");
-            hal.stream.write_all(uitoa(now));
-            hal.stream.write_all("]" ASCII_EOL);
-        }
-    }
-
     if (sys.rt_exec_alarm && (rt_exec = system_clear_exec_alarm())) { // Enter only if any bit flag is true
 
         if((sys.reset_pending = bit_istrue(sys.rt_exec_state, EXEC_RESET))) {
@@ -681,21 +506,6 @@ bool protocol_exec_rt_system (void)
 
             system_clear_exec_state_flag(EXEC_RESET); // Disable any existing reset
 
-            // WEDGE-DBG: this loop blocks EVERYTHING except status reports until Reset arrives AND the
-            // e_stop/motor_fault control signals both read clear - matches the already-observed symptom
-            // of "$X looped forever, controller re-printed its boot banner between attempts" (see
-            // ioSender-side memory iosender-streamer-thread.md). Print once on entry (which alarm, which
-            // signal bits) and once more every ~2s while still stuck, so a repro shows whether the signal
-            // bits ever actually change or the loop is genuinely stuck forever on a latched/false read.
-            {
-                control_signals_t dbg_sig = hal.control.get_state();
-                hal.stream.write_all(dbg_sig.e_stop
-                    ? "[MSG:WEDGE-DBG blocking_event entered, e_stop asserted]" ASCII_EOL
-                    : (dbg_sig.motor_fault
-                        ? "[MSG:WEDGE-DBG blocking_event entered, motor_fault asserted]" ASCII_EOL
-                        : "[MSG:WEDGE-DBG blocking_event entered, neither signal asserted (?)]" ASCII_EOL));
-            }
-
             while(!(sys.abort = bit_istrue(sys.rt_exec_state, EXEC_RESET)) || (hal.control.get_state().bits & blocking_signals.bits)) {
 
                 // Block everything, except reset and status reports, until user issues reset or power
@@ -707,21 +517,6 @@ bool protocol_exec_rt_system (void)
                 if(bit_istrue(sys.rt_exec_state, EXEC_STATUS_REPORT)) {
                     system_clear_exec_state_flag(EXEC_STATUS_REPORT);
                     report_realtime_status(hal.stream.write_all, &hal.stream.report);
-                }
-
-                // WEDGE-DBG: throttled "still stuck" marker, ~every 2s, showing the live signal bits.
-                {
-                    static uint32_t wedge_dbg_last_ms = 0;
-                    uint32_t now_ms = hal.get_elapsed_ticks();
-                    if(now_ms - wedge_dbg_last_ms > 2000) {
-                        wedge_dbg_last_ms = now_ms;
-                        control_signals_t dbg_sig = hal.control.get_state();
-                        hal.stream.write_all(dbg_sig.e_stop
-                            ? "[MSG:WEDGE-DBG blocking_event still stuck, e_stop still asserted]" ASCII_EOL
-                            : (dbg_sig.motor_fault
-                                ? "[MSG:WEDGE-DBG blocking_event still stuck, motor_fault still asserted]" ASCII_EOL
-                                : "[MSG:WEDGE-DBG blocking_event still stuck, no reset received yet]" ASCII_EOL));
-                    }
                 }
 
                 protocol_poll_cmd();
@@ -738,19 +533,6 @@ bool protocol_exec_rt_system (void)
 
         // Execute system abort.
         if((sys.reset_pending = bit_istrue(rt_exec, EXEC_RESET))) {
-
-            // WEDGE-DBG (2026-07, temporary): count how many times THIS branch sees EXEC_RESET true,
-            // separate from mc_reset()'s own fire-count (motion_control.c) - the only two known setters
-            // of EXEC_RESET are mc_reset() and one spindle-sync-gated site in state_machine.c. If this
-            // counter climbs faster than mc_reset()'s, EXEC_RESET is being read as true more often than
-            // it's being freshly set, pointing at either a stale/uncleared flag or an unfound setter.
-            // See ioSender-side memory iosender-streamer-thread.md.
-            {
-                static uint32_t wedge_dbg_reset_branch_count = 0;
-                hal.stream.write_all("[MSG:WEDGE-DBG reset-branch hit, count=");
-                hal.stream.write_all(uitoa(++wedge_dbg_reset_branch_count));
-                hal.stream.write_all("]" ASCII_EOL);
-            }
 
             if(!killed) {
                 // Kill spindle and coolant.
@@ -778,14 +560,6 @@ bool protocol_exec_rt_system (void)
 
         if(rt_exec & EXEC_STOP) { // Experimental for now, must be verified. Do NOT move to interrupt context!
 
-            // WEDGE-DBG (2026-07, temporary): entry to the WHOLE EXEC_STOP branch, not just the
-            // alarm_pending sub-case - fires the instant rt_exec has EXEC_STOP set, regardless of what
-            // happens after. Cross-check against the CMD_STOP byte counter (this file) to see if
-            // EXEC_STOP is being processed without a matching CMD_STOP byte ever having arrived.
-            hal.stream.write_all("[MSG:WEDGE-DBG EXEC_STOP branch entered, rt_exec=");
-            hal.stream.write_all(uitoa((uint32_t)rt_exec));
-            hal.stream.write_all("]" ASCII_EOL);
-
             // Note: homing cannot be cancelled with EXEC_STOP
 
             sys.cancel = true;
@@ -807,16 +581,6 @@ bool protocol_exec_rt_system (void)
 
             if(sys.alarm_pending) {
 
-                // WEDGE-DBG (2026-07, temporary): this is the EXEC_STOP handling branch (this whole
-                // block is entered when rt_exec & EXEC_STOP) re-raising a PENDING alarm. Neither
-                // mc_reset() nor disable_lock() ($X's handler) are known to set sys.alarm_pending or
-                // EXEC_STOP - if this fires, it proves EXEC_STOP itself is getting set from somewhere
-                // not yet found (protocol.c's CMD_STOP realtime-byte case is the only known direct
-                // setter). See ioSender-side memory iosender-streamer-thread.md.
-                hal.stream.write_all("[MSG:WEDGE-DBG EXEC_STOP branch: re-raising alarm_pending=");
-                hal.stream.write_all(uitoa((uint32_t)sys.alarm_pending));
-                hal.stream.write_all("]" ASCII_EOL);
-
                 sys.position_lost = st_is_stepping();
                 system_raise_alarm(sys.alarm_pending);
 
@@ -824,22 +588,9 @@ bool protocol_exec_rt_system (void)
 
                 state_update(EXEC_MOTION_CANCEL_FAST);
 
-                // WEDGE-DBG: this loop (EXEC_STOP handling, marked "Experimental for now, must be
-                // verified" by its own author-comment above) waits here until st_is_stepping() clears -
-                // if the segment buffer/stepper ISR ever fails to signal completion, this spins forever.
-                // One-shot print if it's still going after ~2s, since the STOP button (not Reset or Feed
-                // Hold) is one of the three already-recorded wedge triggers (see ioSender-side memory
-                // iosender-streamer-thread.md).
-                uint32_t wedge_dbg_stop_start_ms = hal.get_elapsed_ticks();
-                wedge_dbg_stop_wait_logged = false;
-
                 do {
                     st_prep_buffer(); // Check and prep segment buffer.
                     grbl.on_execute_realtime(state_get());
-                    if(!wedge_dbg_stop_wait_logged && hal.get_elapsed_ticks() - wedge_dbg_stop_start_ms > 2000) {
-                        wedge_dbg_stop_wait_logged = true;
-                        hal.stream.write_all("[MSG:WEDGE-DBG EXEC_STOP wait-for-stop loop stuck >2s, st_is_stepping still true]" ASCII_EOL);
-                    }
                 } while(st_is_stepping());
 
                 rt_exec |= system_clear_exec_states();
@@ -1104,7 +855,6 @@ ISR_CODE bool ISR_FUNC(protocol_enqueue_realtime_command)(uint8_t c)
             break;
 
         case CMD_STOP:
-            wedge_dbg_cmd_stop_count++; // WEDGE-DBG: see the report site in protocol_exec_rt_system
             system_set_exec_state_flag(EXEC_STOP);
             char_counter = 0;
             hal.stream.cancel_read_buffer();
@@ -1114,8 +864,6 @@ ISR_CODE bool ISR_FUNC(protocol_enqueue_realtime_command)(uint8_t c)
         case CMD_RESET: // Call motion control reset routine.
             if(!hal.control.get_state().e_stop)
                 mc_reset();
-            else
-                wedge_dbg_reset_blocked_estop = true; // WEDGE-DBG: Reset is a silent no-op while e_stop reads asserted - reported from protocol_exec_rt_system, not here (ISR context)
             drop = true;
             break;
 

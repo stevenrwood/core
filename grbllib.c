@@ -454,16 +454,6 @@ FLASHMEM int grbl_enter (void)
     // will return to this loop to be cleanly re-initialized.
     while(looping) {
 
-        // WEDGE-DBG (2026-07, temporary): capture sys.abort/cancel/position_lost/rt_exec_state
-        // BEFORE the memset below clears them - i.e. exactly why protocol_main_loop() just returned.
-        // CAPTURE here, but PRINT later (right before the welcome banner, alongside the working
-        // "reboot count" print) - a write_all this early (before the stream is re-pointed to the
-        // active connection for this iteration) was silently swallowed, confirmed by it never
-        // appearing even for a known-good, expected reboot. See ioSender-side memory
-        // iosender-streamer-thread.md.
-        bool wedge_dbg_abort = sys.abort, wedge_dbg_cancel = sys.cancel, wedge_dbg_pos_lost = sys.position_lost;
-        rt_exec_t wedge_dbg_rt_exec_state = sys.rt_exec_state;
-
         spindle_num_t spindle_num = N_SYS_SPINDLE;
 
         // Reset report entry points
@@ -494,12 +484,6 @@ FLASHMEM int grbl_enter (void)
 
         // Reset primary systems.
         hal.stream.reset_read_buffer();                 // Clear input stream buffer
-        // WEDGE-DBG (2026-07, part of the fix): reset_write_buffer was defined in the HAL interface
-        // (optional, "Required for Modbus/RS-485 support") and even implemented by telnetd.c, but never
-        // called anywhere in this reboot sequence on ANY transport - so a stale, partially-transmitted
-        // TX message from before the reset could leak out merged with this reboot's own output, with no
-        // separator. Observed as a garbled/concatenated "ALARM:" line following a Reset-during-motion
-        // repro, on both Serial and Telnet (see ioSender-side memory iosender-streamer-thread.md).
         if(hal.stream.reset_write_buffer)
             hal.stream.reset_write_buffer();            // Clear output stream buffer
         gc_init(settings.flags.keep_offsets_on_reset);  // Set g-code parser to default state
@@ -518,41 +502,14 @@ FLASHMEM int grbl_enter (void)
         if(!hal.driver_cap.atc)
             tc_init();
 
-        // WEDGE-DBG (2026-07, temporary): count + report each full reboot cycle, right before the
-        // welcome banner. Compared against mc_reset()'s own fire-count (motion_control.c) to tell
-        // whether reboots are being triggered ONLY via mc_reset(), or via some other path that sets
-        // sys.abort without going through it - see ioSender-side memory iosender-streamer-thread.md.
-        {
-            static uint32_t wedge_dbg_reboot_count = 0;
-            // WEDGE-DBG: protocol_main_loop()'s two bail-point counters, reported here (not at their
-            // own increment site) because this print has proven 100% reliable across every repro,
-            // while the bail points' own write_all() calls have not - see protocol.c for why.
-            extern volatile uint32_t wedge_dbg_bail_line_count, wedge_dbg_bail_outer_count;
-            hal.stream.write_all("[MSG:WEDGE-DBG reboot count=");
-            hal.stream.write_all(uitoa(++wedge_dbg_reboot_count));
-            hal.stream.write_all(" abort=");
-            hal.stream.write_all(wedge_dbg_abort ? "1" : "0");
-            hal.stream.write_all(" cancel=");
-            hal.stream.write_all(wedge_dbg_cancel ? "1" : "0");
-            hal.stream.write_all(" position_lost=");
-            hal.stream.write_all(wedge_dbg_pos_lost ? "1" : "0");
-            hal.stream.write_all(" rt_exec_state=");
-            hal.stream.write_all(uitoa((uint32_t)wedge_dbg_rt_exec_state));
-            hal.stream.write_all(" bail_line=");
-            hal.stream.write_all(uitoa(wedge_dbg_bail_line_count));
-            hal.stream.write_all(" bail_outer=");
-            hal.stream.write_all(uitoa(wedge_dbg_bail_outer_count));
-            hal.stream.write_all("]" ASCII_EOL);
-        }
-
         // Print welcome message. Indicates an initialization has occurred at power-up or with a reset.
         grbl.report.init_message(hal.stream.write_all);
 
-        // WEDGE-DBG (2026-07, temporary): surface Teensyduino's CrashReport (if a real CPU fault
-        // wrote one) right after the boot banner - see usb_serial_ard.cpp for why. No-ops silently
-        // when there's nothing to report (CRC-invalid/cleared), so safe on every ordinary reboot.
-        extern void wedge_dbg_report_crash(void);
-        wedge_dbg_report_crash();
+        // Surface a Teensyduino CrashReport (a real CPU fault record), if one exists, right after the
+        // boot banner - see usb_serial_ard.cpp for the bridge implementation. No-ops silently when
+        // there's nothing to report, so this is safe on every ordinary reboot.
+        extern void report_crash_if_any(void);
+        report_crash_if_any();
 
         if(!settings.flags.no_unlock_after_estop && state_get() == STATE_ESTOP)
             state_set(STATE_ALARM);
