@@ -65,6 +65,17 @@ static volatile bool wedge_dbg_reset_blocked_estop = false; // set in ISR, see p
 static bool wedge_dbg_stop_wait_logged = false;             // one-shot guard, EXEC_STOP wait-for-stop loop
 static volatile uint32_t wedge_dbg_cmd_stop_count = 0;      // set in ISR, see CMD_STOP case below
 
+// WEDGE-DBG: counters for protocol_main_loop()'s only two return points (verified by enumerating
+// every `return` in the function - there is no third). A prior repro showed NEITHER of these two
+// bail points' own write_all() prints ever fired, not even for a confirmed-legitimate Reset - most
+// likely because those writes happen BEFORE grbl_enter()'s reinit loop runs
+// hal.stream.reset_write_buffer(), so if the stream's TX state is already compromised at that exact
+// moment, the bytes are lost silently. These counters can't be swallowed the same way (no write
+// involved at the increment site) and are reported from grbllib.c's already-proven-reliable
+// per-reboot print, alongside "reboot count=". Non-static: read from grbllib.c via extern.
+volatile uint32_t wedge_dbg_bail_line_count = 0;   // the per-line checkpoint (~protocol_execute_realtime() false)
+volatile uint32_t wedge_dbg_bail_outer_count = 0;  // the per-outer-loop-iteration checkpoint
+
 static void protocol_exec_rt_suspend (sys_state_t state);
 
 // add gcode to execute not originating from normal input stream
@@ -269,6 +280,7 @@ bool protocol_main_loop (void)
                     eol = (char)c;
 
                 if(!protocol_execute_realtime()) { // Runtime command check point.
+                    wedge_dbg_bail_line_count++; // WEDGE-DBG: see grbllib.c's reboot report
                     // WEDGE-DBG (2026-07, temporary): this bail path re-enters the FULL reboot cycle
                     // WITHOUT going through mc_reset() - confirmed via the mc_reset/reboot counters
                     // (motion_control.c/grbllib.c) staying out of sync during a repro. Print exactly
@@ -461,6 +473,7 @@ bool protocol_main_loop (void)
         }
 
         if(!protocol_execute_realtime() && sys.abort) { // Runtime command check point.
+            wedge_dbg_bail_outer_count++; // WEDGE-DBG: see grbllib.c's reboot report
             // WEDGE-DBG (2026-07, temporary): the OTHER bail checkpoint (distinct from the per-line
             // one already instrumented above) - runs once per outer while(true) iteration, after all
             // currently-available characters are drained. If this is what's firing for the mystery

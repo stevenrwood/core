@@ -524,6 +524,10 @@ FLASHMEM int grbl_enter (void)
         // sys.abort without going through it - see ioSender-side memory iosender-streamer-thread.md.
         {
             static uint32_t wedge_dbg_reboot_count = 0;
+            // WEDGE-DBG: protocol_main_loop()'s two bail-point counters, reported here (not at their
+            // own increment site) because this print has proven 100% reliable across every repro,
+            // while the bail points' own write_all() calls have not - see protocol.c for why.
+            extern volatile uint32_t wedge_dbg_bail_line_count, wedge_dbg_bail_outer_count;
             hal.stream.write_all("[MSG:WEDGE-DBG reboot count=");
             hal.stream.write_all(uitoa(++wedge_dbg_reboot_count));
             hal.stream.write_all(" abort=");
@@ -534,6 +538,10 @@ FLASHMEM int grbl_enter (void)
             hal.stream.write_all(wedge_dbg_pos_lost ? "1" : "0");
             hal.stream.write_all(" rt_exec_state=");
             hal.stream.write_all(uitoa((uint32_t)wedge_dbg_rt_exec_state));
+            hal.stream.write_all(" bail_line=");
+            hal.stream.write_all(uitoa(wedge_dbg_bail_line_count));
+            hal.stream.write_all(" bail_outer=");
+            hal.stream.write_all(uitoa(wedge_dbg_bail_outer_count));
             hal.stream.write_all("]" ASCII_EOL);
         }
 
