@@ -35,8 +35,31 @@
 #endif
 #endif
 
-DCRAM static stream_rx_buffer_t rxbackup;
-DCRAM static stream_rx_linebuffer_t linerxbackup;
+// WEDGE-DBG (2026-07): these backup slots used to be FULL stream_rx_buffer_t/stream_rx_linebuffer_t
+// copies - up to 16KB for the line-ring version, almost entirely the raw data[][] payload - even
+// though that payload never moves; only the bookkeeping describing where to find it does. That made
+// the tool-change-ack backup/restore memcpy() big, slow, and entirely unprotected against a
+// concurrent ISR write (network RX for Telnet) - a torn 16KB copy racing an interrupt is a much
+// bigger window than the flush()/cancel() race fixed earlier (which did NOT resolve the reset-wedge
+// investigation's runaway ring spin). Shrunk to bookkeeping-only shadow structs, now cheap enough to
+// copy inside a proper critical section. See ioSender-side memory iosender-streamer-thread.md.
+typedef struct {
+    uint_fast16_t head;
+    uint_fast16_t tail;
+    bool rts_state;
+    bool overflow;
+} stream_rx_buffer_meta_t;
+
+typedef struct {
+    uint_fast8_t head;
+    uint_fast8_t tail;
+    uint_fast16_t rpos;
+    uint_fast16_t len[RX_LINE_BUFFERS];
+    bool overflow;
+} stream_rx_linebuffer_meta_t;
+
+DCRAM static stream_rx_buffer_meta_t rxbackup;
+DCRAM static stream_rx_linebuffer_meta_t linerxbackup;
 
 typedef struct {
     enqueue_realtime_command_ptr enqueue_realtime_command;
@@ -166,7 +189,11 @@ FLASHMEM const io_stream_status_t *stream_get_uart_status (uint8_t instance)
 ISR_CODE static bool ISR_FUNC(await_toolchange_ack)(uint8_t c)
 {
     if(c == CMD_TOOL_ACK && !stream.rxbuffer->backup) {
-        memcpy(&rxbackup, stream.rxbuffer, sizeof(stream_rx_buffer_t));
+        // WEDGE-DBG (2026-07): only the bookkeeping needs saving - see rxbackup's declaration above.
+        rxbackup.head = stream.rxbuffer->head;
+        rxbackup.tail = stream.rxbuffer->tail;
+        rxbackup.rts_state = stream.rxbuffer->rts_state;
+        rxbackup.overflow = stream.rxbuffer->overflow;
         stream.rxbuffer->backup = true;
         stream.rxbuffer->tail = stream.rxbuffer->head;
         hal.stream.read = stream.read; // restore normal input
@@ -203,8 +230,18 @@ FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
             hal.stream.read = stream_get_null;
         }
     } else if((ok = stream.rxbuffer)) {
-        if(rxbuffer->backup)
-            memcpy(rxbuffer, &rxbackup, sizeof(stream_rx_buffer_t));
+        if(rxbuffer->backup) {
+            // WEDGE-DBG (2026-07): restore only the bookkeeping (see rxbackup's declaration above) -
+            // critical section so this can't race the ISR-side backup in await_toolchange_ack() above,
+            // now cheap enough (a few bytes) that disabling interrupts for it is a non-issue.
+            hal.irq_disable();
+            rxbuffer->head = rxbackup.head;
+            rxbuffer->tail = rxbackup.tail;
+            rxbuffer->rts_state = rxbackup.rts_state;
+            rxbuffer->overflow = rxbackup.overflow;
+            rxbuffer->backup = false;
+            hal.irq_enable();
+        }
         if(stream.enqueue_realtime_command) {
             hal.stream.read = stream.read; // restore normal input
             hal.stream.set_enqueue_rt_handler(stream.enqueue_realtime_command);
@@ -378,7 +415,15 @@ void stream_rx_linebuffer_cancel (stream_rx_linebuffer_t *rxbuffer)
 ISR_CODE static bool ISR_FUNC(await_toolchange_ack_linebuffer)(uint8_t c)
 {
     if(c == CMD_TOOL_ACK && !linestream.rxbuffer->backup) {
-        memcpy(&linerxbackup, linestream.rxbuffer, sizeof(stream_rx_linebuffer_t));
+        // WEDGE-DBG (2026-07): only the bookkeeping needs saving, NOT the 16KB data[][] payload - see
+        // linerxbackup's declaration above.
+        uint_fast8_t wedge_dbg_i;
+        linerxbackup.head = linestream.rxbuffer->head;
+        linerxbackup.tail = linestream.rxbuffer->tail;
+        linerxbackup.rpos = linestream.rxbuffer->rpos;
+        linerxbackup.overflow = linestream.rxbuffer->overflow;
+        for(wedge_dbg_i = 0; wedge_dbg_i < RX_LINE_BUFFERS; wedge_dbg_i++)
+            linerxbackup.len[wedge_dbg_i] = linestream.rxbuffer->len[wedge_dbg_i];
         linestream.rxbuffer->backup = true;
         linestream.rxbuffer->tail = linestream.rxbuffer->head;
         hal.stream.read = linestream.read; // restore normal input
@@ -404,8 +449,21 @@ FLASHMEM bool stream_rx_linebuffer_suspend (stream_rx_linebuffer_t *rxbuffer, bo
             hal.stream.read = stream_get_null;
         }
     } else if((ok = linestream.rxbuffer != NULL)) {
-        if(rxbuffer->backup)
-            memcpy(rxbuffer, &linerxbackup, sizeof(stream_rx_linebuffer_t));
+        if(rxbuffer->backup) {
+            // WEDGE-DBG (2026-07): restore only the bookkeeping - critical section so this can't race
+            // the ISR-side backup in await_toolchange_ack_linebuffer() above. Now a few hundred bytes
+            // instead of 16KB, so disabling interrupts for it is a non-issue.
+            uint_fast8_t wedge_dbg_i;
+            hal.irq_disable();
+            rxbuffer->head = linerxbackup.head;
+            rxbuffer->tail = linerxbackup.tail;
+            rxbuffer->rpos = linerxbackup.rpos;
+            rxbuffer->overflow = linerxbackup.overflow;
+            for(wedge_dbg_i = 0; wedge_dbg_i < RX_LINE_BUFFERS; wedge_dbg_i++)
+                rxbuffer->len[wedge_dbg_i] = linerxbackup.len[wedge_dbg_i];
+            rxbuffer->backup = false;
+            hal.irq_enable();
+        }
         if(linestream.enqueue_realtime_command) {
             hal.stream.read = linestream.read; // restore normal input
             hal.stream.set_enqueue_rt_handler(linestream.enqueue_realtime_command);
