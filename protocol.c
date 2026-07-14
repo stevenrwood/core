@@ -250,12 +250,19 @@ bool protocol_main_loop (void)
                     // counter (stream.c) - if this stays far below wedge_dbg_inner_reads, the phantom
                     // data isn't coming from that function at all (hal.stream.read points elsewhere).
                     extern volatile uint32_t wedge_dbg_get_real_count;
+                    // WEDGE-DBG: get_real ruled out stream_rx_linebuffer_get() as the source, and
+                    // fs_stream.c/macros.c's file-redirect traces never fired either (neither macro
+                    // subsystem was engaged) - so print the RAW ADDRESS of hal.stream.read itself.
+                    // Look it up in firmware.elf afterward (arm-none-eabi-nm/addr2line) for a
+                    // definitive answer instead of guessing at more candidate functions.
                     hal.stream.write_all("[MSG:WEDGE-DBG inner-loop alive, tick=");
                     hal.stream.write_all(uitoa(wedge_dbg_now));
                     hal.stream.write_all(" reads=");
                     hal.stream.write_all(uitoa(wedge_dbg_inner_reads));
                     hal.stream.write_all(" get_real=");
                     hal.stream.write_all(uitoa(wedge_dbg_get_real_count));
+                    hal.stream.write_all(" read_fn="); // decimal address (uitoa has no hex mode) - convert offline
+                    hal.stream.write_all(uitoa((uint32_t)(uintptr_t)hal.stream.read));
                     hal.stream.write_all(" last_c=");
                     hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
                     hal.stream.write_all("]" ASCII_EOL);
