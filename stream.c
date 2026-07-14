@@ -307,20 +307,44 @@ void stream_rx_linebuffer_flush (stream_rx_linebuffer_t *rxbuffer)
 {
     uint_fast8_t i;
 
+    // WEDGE-DBG (2026-07): this runs on the foreground thread (grbl_enter()'s reinit loop on every
+    // Reset, and protocol.c's blocking_event handler), while stream_rx_linebuffer_put() can be
+    // called from a genuine interrupt context (lwIP's tcp_recv, driven by the Ethernet RX interrupt
+    // chain, for Telnet). With no critical section here, a concurrent put() mid-loop could leave
+    // head/tail/len[] torn/inconsistent. Matches the observed symptom exactly: a permanent,
+    // self-sustaining "always more data" spin inside stream_rx_linebuffer_get() with zero new bytes
+    // ever actually arriving (tens of millions of phantom reads/sec, forever, only clearable by a
+    // power-cycle). See ioSender-side memory iosender-streamer-thread.md.
+    hal.irq_disable();
+
     for(i = 0; i < RX_LINE_BUFFERS; i++)
         rxbuffer->len[i] = 0;
 
     rxbuffer->head = rxbuffer->tail = 0;
     rxbuffer->rpos = 0;
+
+    hal.irq_enable();
 }
 
 void stream_rx_linebuffer_cancel (stream_rx_linebuffer_t *rxbuffer)
 {
-    stream_rx_linebuffer_flush(rxbuffer);
+    uint_fast8_t i;
+
+    // WEDGE-DBG (2026-07): inlines the flush (rather than calling stream_rx_linebuffer_flush()) so
+    // the whole operation - clear plus the CAN-marker write below - runs in ONE critical section, not
+    // two back to back with an unprotected gap between them. Same race as flush() above.
+    hal.irq_disable();
+
+    for(i = 0; i < RX_LINE_BUFFERS; i++)
+        rxbuffer->len[i] = 0;
+    rxbuffer->head = rxbuffer->tail = 0;
+    rxbuffer->rpos = 0;
 
     rxbuffer->data[rxbuffer->head][0] = ASCII_CAN;
     rxbuffer->len[rxbuffer->head] = 1;
     rxbuffer->head = LINEBUFNEXT(rxbuffer->head);
+
+    hal.irq_enable();
 }
 
 ISR_CODE static bool ISR_FUNC(await_toolchange_ack_linebuffer)(uint8_t c)
