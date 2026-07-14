@@ -218,6 +218,33 @@ bool protocol_main_loop (void)
         // initial filtering by removing leading spaces and control characters.
         while((c = hal.stream.read()) != SERIAL_NO_DATA) {
 
+            // WEDGE-DBG (2026-07, temporary): throttled (1/sec, by wall-clock, not by character
+            // count) liveness sample INSIDE the inner read loop, gated to STATE_ALARM. The
+            // outer-loop heartbeat (below, after this inner loop) never fired even once across an
+            // 18s stuck-alarm window with 3 separate $X attempts - i.e. execution never reaches
+            // that point. This checks the remaining hypothesis: hal.stream.read() never returns
+            // SERIAL_NO_DATA again after the reboot, so the inner loop itself never exits. Safe even
+            // if this loop is genuinely spinning at full speed, since the print is time-gated, not
+            // per-iteration. If even THIS never appears, hal.stream.read() itself is not returning
+            // at all (blocked in the HAL/driver layer), not just looping in C. See ioSender-side
+            // memory iosender-streamer-thread.md.
+            if(state_get() & STATE_ALARM) {
+                static uint32_t wedge_dbg_last_inner = 0;
+                static uint32_t wedge_dbg_inner_reads = 0;
+                wedge_dbg_inner_reads++;
+                uint32_t wedge_dbg_now = hal.get_elapsed_ticks();
+                if(wedge_dbg_now - wedge_dbg_last_inner >= 1000) {
+                    wedge_dbg_last_inner = wedge_dbg_now;
+                    hal.stream.write_all("[MSG:WEDGE-DBG inner-loop alive, tick=");
+                    hal.stream.write_all(uitoa(wedge_dbg_now));
+                    hal.stream.write_all(" reads=");
+                    hal.stream.write_all(uitoa(wedge_dbg_inner_reads));
+                    hal.stream.write_all(" last_c=");
+                    hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
+                    hal.stream.write_all("]" ASCII_EOL);
+                }
+            }
+
             if(c == ASCII_CAN) {
 
                 eol = xcommand[0] = '\0';
