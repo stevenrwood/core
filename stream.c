@@ -255,6 +255,15 @@ FLASHMEM bool stream_rx_suspend (stream_rx_buffer_t *rxbuffer, bool suspend)
 
 // --- line-ring RX buffer (stream_rx_linebuffer_t) - see stream.h for the design rationale ---
 
+// WEDGE-DBG (2026-07, temporary): the ring-state dump inside stream_rx_linebuffer_get() below
+// stopped appearing entirely after a reboot in the last repro, while protocol.c's "inner-loop alive"
+// heartbeat (same 1-second throttle idiom, different function) kept firing reliably the whole time.
+// Since write_all() calls are already known to be swallowed in this failure state (see the bail-point
+// counters), that alone doesn't prove stream_rx_linebuffer_get() isn't being called - a plain counter,
+// reported via protocol.c's already-reliable channel instead of its own write, settles it either way.
+// Non-static: read from protocol.c via extern.
+volatile uint32_t wedge_dbg_get_real_count = 0;
+
 // WEDGE-DBG (2026-07, temporary): print raw ring state whenever this function does something
 // anomalous (rejects a terminator because the ring is full, or truncates an over-length line).
 // These are the two ways a line can be silently lost/corrupted from here - see protocol.c's own
@@ -312,6 +321,8 @@ int32_t stream_rx_linebuffer_get (stream_rx_linebuffer_t *rxbuffer)
 {
     if(rxbuffer->tail == rxbuffer->head)
         return SERIAL_NO_DATA; // no completed line queued
+
+    wedge_dbg_get_real_count++; // WEDGE-DBG: see protocol.c's "inner-loop alive" print
 
     // WEDGE-DBG (2026-07, temporary): throttled (1/sec) raw ring-state dump, fires only when real
     // (non-empty) data is about to be returned - the flush()/cancel() critical-section fix didn't

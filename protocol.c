@@ -246,10 +246,16 @@ bool protocol_main_loop (void)
                 uint32_t wedge_dbg_now = hal.get_elapsed_ticks();
                 if(wedge_dbg_now - wedge_dbg_last_inner >= 1000) {
                     wedge_dbg_last_inner = wedge_dbg_now;
+                    // WEDGE-DBG: cross-check against stream_rx_linebuffer_get()'s own real-data
+                    // counter (stream.c) - if this stays far below wedge_dbg_inner_reads, the phantom
+                    // data isn't coming from that function at all (hal.stream.read points elsewhere).
+                    extern volatile uint32_t wedge_dbg_get_real_count;
                     hal.stream.write_all("[MSG:WEDGE-DBG inner-loop alive, tick=");
                     hal.stream.write_all(uitoa(wedge_dbg_now));
                     hal.stream.write_all(" reads=");
                     hal.stream.write_all(uitoa(wedge_dbg_inner_reads));
+                    hal.stream.write_all(" get_real=");
+                    hal.stream.write_all(uitoa(wedge_dbg_get_real_count));
                     hal.stream.write_all(" last_c=");
                     hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
                     hal.stream.write_all("]" ASCII_EOL);
