@@ -218,24 +218,6 @@ bool protocol_main_loop (void)
         // initial filtering by removing leading spaces and control characters.
         while((c = hal.stream.read()) != SERIAL_NO_DATA) {
 
-            // WEDGE-DBG (2026-07, temporary): per-character read trace, GATED to STATE_ALARM only.
-            // The unrestricted version of this (every character, any state) proved the parser was
-            // reachable, but flooded the link badly enough to freeze ioSender's UI for a whole job's
-            // duration (see ioSender-side memory iosender-streamer-thread.md) - removed in 80cea95.
-            // Gating on STATE_ALARM keeps it silent during normal job streaming (thousands of chars/
-            // sec) while still covering the one window that matters for the reset-wedge investigation:
-            // post-reboot, alarmed, waiting on $X - traffic there is just periodic '?' polls, so this
-            // is bounded and safe.
-            if(state_get() & STATE_ALARM) {
-                char dbgc[8];
-                dbgc[0] = '['; dbgc[1] = (char)c; dbgc[2] = ']';
-                dbgc[3] = '\0';
-                hal.stream.write_all("[MSG:WEDGE-DBG char read (alarm): ");
-                hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
-                hal.stream.write_all(c >= 0x20 && c < 0x7F ? dbgc : "[?]");
-                hal.stream.write_all("]" ASCII_EOL);
-            }
-
             if(c == ASCII_CAN) {
 
                 eol = xcommand[0] = '\0';
