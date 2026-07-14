@@ -218,6 +218,24 @@ bool protocol_main_loop (void)
         // initial filtering by removing leading spaces and control characters.
         while((c = hal.stream.read()) != SERIAL_NO_DATA) {
 
+            // WEDGE-DBG (2026-07, temporary): per-character read trace, GATED to STATE_ALARM only.
+            // The unrestricted version of this (every character, any state) proved the parser was
+            // reachable, but flooded the link badly enough to freeze ioSender's UI for a whole job's
+            // duration (see ioSender-side memory iosender-streamer-thread.md) - removed in 80cea95.
+            // Gating on STATE_ALARM keeps it silent during normal job streaming (thousands of chars/
+            // sec) while still covering the one window that matters for the reset-wedge investigation:
+            // post-reboot, alarmed, waiting on $X - traffic there is just periodic '?' polls, so this
+            // is bounded and safe.
+            if(state_get() & STATE_ALARM) {
+                char dbgc[8];
+                dbgc[0] = '['; dbgc[1] = (char)c; dbgc[2] = ']';
+                dbgc[3] = '\0';
+                hal.stream.write_all("[MSG:WEDGE-DBG char read (alarm): ");
+                hal.stream.write_all(uitoa((uint32_t)(uint8_t)c));
+                hal.stream.write_all(c >= 0x20 && c < 0x7F ? dbgc : "[?]");
+                hal.stream.write_all("]" ASCII_EOL);
+            }
+
             if(c == ASCII_CAN) {
 
                 eol = xcommand[0] = '\0';
@@ -398,6 +416,27 @@ bool protocol_main_loop (void)
         // this indicates that g-code streaming has either filled the planner buffer or has
         // completed. In either case, auto-cycle start, if enabled, any queued moves.
         protocol_auto_cycle_start();
+
+        // WEDGE-DBG (2026-07, temporary): throttled liveness heartbeat for the outer while(true)
+        // loop, gated to STATE_ALARM (silent during normal job streaming - no flood risk). Placed
+        // BEFORE protocol_execute_realtime() below so it still fires even if that call turns out to
+        // block/spin. Combined with the per-character alarm-state trace above: if this heartbeat
+        // keeps printing but no char-read trace ever appears despite the RX-free byte count visibly
+        // draining (status reports), the outer loop is alive and calling hal.stream.read() every
+        // iteration, but read() itself never sees the pending bytes - points at the stream/driver
+        // layer, not this loop. If this heartbeat stops appearing entirely, the loop itself got stuck
+        // (most likely inside protocol_execute_realtime(), called right after this). See ioSender-side
+        // memory iosender-streamer-thread.md.
+        if(state_get() & STATE_ALARM) {
+            static uint32_t wedge_dbg_last_heartbeat = 0;
+            uint32_t wedge_dbg_now = hal.get_elapsed_ticks();
+            if(wedge_dbg_now - wedge_dbg_last_heartbeat >= 1000) {
+                wedge_dbg_last_heartbeat = wedge_dbg_now;
+                hal.stream.write_all("[MSG:WEDGE-DBG alarm-loop alive, tick=");
+                hal.stream.write_all(uitoa(wedge_dbg_now));
+                hal.stream.write_all("]" ASCII_EOL);
+            }
+        }
 
         if(!protocol_execute_realtime() && sys.abort) { // Runtime command check point.
             // WEDGE-DBG (2026-07, temporary): the OTHER bail checkpoint (distinct from the per-line
