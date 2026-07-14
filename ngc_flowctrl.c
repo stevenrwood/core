@@ -366,8 +366,22 @@ FLASHMEM void ngc_flowctrl_init (void)
     }
 
     clear_subs(NULL);
-    while(stack_idx >= 0)
+    // WEDGE-DBG (2026-07): this reset-time unwind previously just called stack_pull() for every
+    // entry, which clears the stack's OWN bookkeeping but never calls stream_redirect_close() - unlike
+    // stack_unwind_sub() below, which does exactly that for named-subroutine entries (o_label >
+    // NGC_MAX_PARAM_ID, i.e. entries that actually opened a file via stream_redirect_read()). If a
+    // Reset landed while a named O-call (e.g. a Start Job macro file) was active, hal.stream.read
+    // stayed permanently stuck on stream_read_file (stream_file.c) - explaining a self-sustaining
+    // phantom-data loop needing no real ISR/network traffic, confirmed via the read_fn address print
+    // resolving to stream_read_file in the last repro. See ioSender-side memory
+    // iosender-streamer-thread.md.
+    while(stack_idx >= 0) {
+        if(stack[stack_idx].o_label > NGC_MAX_PARAM_ID) {
+            hal.stream.write_all("[MSG:WEDGE-DBG ngc_flowctrl_init: closing leaked named-sub redirect]" ASCII_EOL);
+            stream_redirect_close(stack[stack_idx].file);
+        }
         stack_pull();
+    }
 }
 
 // NOTE: onNamedSubError will be called recursively for each
