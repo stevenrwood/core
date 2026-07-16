@@ -511,6 +511,10 @@ FLASHMEM int grbl_enter (void)
         extern void report_crash_if_any(void);
         report_crash_if_any();
 
+        // Arms/re-arms the hardware hang watchdog (WDOG1) - see usb_serial_ard.cpp. Idempotent.
+        extern void hang_watchdog_init(void);
+        hang_watchdog_init();
+
         if(!settings.flags.no_unlock_after_estop && state_get() == STATE_ESTOP)
             state_set(STATE_ALARM);
 

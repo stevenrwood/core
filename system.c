@@ -569,6 +569,23 @@ FLASHMEM static status_code_t home_w (sys_state_t state, char *args)
 }
 #endif
 
+#ifdef ENABLE_HANG_TEST_CMD
+// Deliberately hangs forever, to validate the hang-watchdog feature (protocol.c's watchdog_begin/
+// _end + usb_serial_ard.cpp's hang_watchdog_*) end to end without waiting for a real bug to
+// reproduce - this command runs on the exact same dispatch path (system_execute_line, wrapped by
+// watchdog_begin/_end) that any other stuck $-command or g-code line would. Off by default - only
+// exists in a build with ENABLE_HANG_TEST_CMD defined; never enable this for a build that goes on
+// a machine actually running jobs.
+FLASHMEM static status_code_t hang_forever (sys_state_t state, char *args)
+{
+    for(;;) {
+        __asm__ volatile ("nop");
+    }
+
+    return Status_OK; // unreachable
+}
+#endif
+
 FLASHMEM static status_code_t enter_sleep (sys_state_t state, char *args)
 {
     if(!settings.flags.sleep_enable)
@@ -639,6 +656,10 @@ FLASHMEM static status_code_t build_info (sys_state_t state, char *args)
         char info[sizeof(stored_line_t)];
         settings_read_build_info(info);
         report_build_info(info, false);
+        // Teensy4/iMXRT1062-specific, see usb_serial_ard.cpp - no-ops if the last reboot wasn't
+        // caused by the hang watchdog.
+        extern void report_hang_watchdog_summary(void);
+        report_hang_watchdog_summary();
     }
   #if !DISABLE_BUILD_INFO_WRITE_COMMAND
     else if (strlen(args) < (sizeof(stored_line_t) - 1))
@@ -656,6 +677,10 @@ FLASHMEM static status_code_t output_all_build_info (sys_state_t state, char *ar
 
     settings_read_build_info(info);
     report_build_info(info, true);
+    // ioSender actually queries $I+ (extended), not plain $I, whenever ExtendedProtocol is set (the
+    // grblHAL case) - see GrblInfo.Get() in Grbl.cs. Teensy4/iMXRT1062-specific, see usb_serial_ard.cpp.
+    extern void report_hang_watchdog_summary(void);
+    report_hang_watchdog_summary();
 
     return Status_OK;
 }
@@ -1027,6 +1052,9 @@ PROGMEM static const sys_command_t sys_commands[] = {
     { "DWNGRD", settings_downgrade, { .noargs = On, .allow_blocking = On }, { .str = "toggle setting flags for downgrade" } },
 #ifdef DEBUG
     { "Q", output_memmap, { .noargs = On }, { .str = "output NVS memory allocation" } },
+#endif
+#ifdef ENABLE_HANG_TEST_CMD
+    { "HANG", hang_forever, { .noargs = On }, { .str = "TEST ONLY: spin forever to validate the hang watchdog" } },
 #endif
 };
 

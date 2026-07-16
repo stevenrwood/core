@@ -33,6 +33,8 @@
 #include "sleep.h"
 #include "protocol.h"
 #include "machine_limits.h"
+#include "report.h"
+#include "task.h"
 
 #ifndef RT_QUEUE_SIZE
 #define RT_QUEUE_SIZE 16 // must be a power of 2
@@ -56,6 +58,74 @@ static char line[LINE_BUFFER_SIZE]; // Line to be executed. Zero-terminated.
 static char xcommand[LINE_BUFFER_SIZE];
 static bool keep_rt_commands = false;
 static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see protocol_main_loop
+
+// Defensive diagnostic, not a fix: flags the line/command currently being dispatched (watchdog_begin/_end
+// wrap every system_execute_line/gc_execute_block call below) and how long it has been running. A systick
+// task (watchdog_systick) logs a [MSG:WATCHDOG ...] + a full status report if a single dispatch hasn't
+// returned within WATCHDOG_STUCK_MS. Registered once (wd_installed) the first time protocol_main_loop runs,
+// so it survives soft-reset re-entries without double-registering. Aimed at the same symptom shape as the
+// 2026-07 streamer-thread wedge (hal.stream.read stuck, main loop still spinning but nothing ever
+// completes) - the loop keeps calling protocol_execute_realtime() every iteration even in that class of
+// hang, so a systick task still runs and TX stayed alive in that investigation even though RX was the
+// thing actually stuck - so this should reliably get a report out instead of needing another cold
+// hardware/JTAG dig to even see that something's wrong. Logs once per stall (wd_logged), not every tick.
+#ifndef WATCHDOG_STUCK_MS
+#define WATCHDOG_STUCK_MS 5000
+#endif
+
+static volatile uint32_t wd_start_ms = 0;
+static volatile bool wd_active = false, wd_logged = false, wd_installed = false;
+static char wd_line[LINE_BUFFER_SIZE];
+
+// Hardware backstop for this same diagnostic (Teensy4/iMXRT1062-specific, see usb_serial_ard.cpp):
+// hang_watchdog_arm records the line and feeds WDOG1, hang_watchdog_feed feeds it again once the
+// dispatch returns. Forward progress (a dispatch actually completing) is required to keep the timer
+// fed - if one never returns, WDOG1 resets the board and the next boot's report_crash_if_any() names
+// the line that was in flight. The soft log above still fires first (WATCHDOG_STUCK_MS < WDOG1's
+// timeout) so a stall that eventually clears on its own is visible without forcing a reboot.
+extern void hang_watchdog_arm(const char *line);
+extern void hang_watchdog_feed(void);
+
+static void watchdog_begin (const char *cmd_line)
+{
+    strncpy(wd_line, cmd_line, sizeof(wd_line) - 1);
+    wd_line[sizeof(wd_line) - 1] = '\0';
+    wd_start_ms = hal.get_elapsed_ticks();
+    wd_logged = false;
+    wd_active = true;
+    hang_watchdog_arm(cmd_line);
+}
+
+static void watchdog_end (void)
+{
+    wd_active = false;
+}
+
+// task_add_systick tasks are FOREGROUND tasks (foreground_task_ptr) - cooperatively driven from
+// protocol_execute_realtime(), called once per protocol_main_loop iteration, NOT a real hardware
+// ISR. So this runs on every idle/normal iteration (feeding WDOG1 is correct and safe there - the
+// loop is making progress) and, critically, STOPS running if a single dispatch (watchdog_begin
+// called, watchdog_end never reached) blocks the loop from ever calling protocol_execute_realtime
+// again - which is the actual hang this feature exists to catch. Feed every tick EXCEPT once a
+// dispatch has been stuck past the soft-log threshold, so WDOG1's own timeout (longer than
+// WATCHDOG_STUCK_MS, see hang_watchdog_init) can run out and reset the board.
+static void watchdog_systick (void *data)
+{
+    if(wd_active && (hal.get_elapsed_ticks() - wd_start_ms) >= WATCHDOG_STUCK_MS) {
+        if(!wd_logged) {
+            wd_logged = true;
+            hal.stream.write_all("[MSG:WATCHDOG stuck_ms=");
+            hal.stream.write_all(uitoa(hal.get_elapsed_ticks() - wd_start_ms));
+            hal.stream.write_all(" line=\"");
+            hal.stream.write_all(wd_line);
+            hal.stream.write_all("\"]" ASCII_EOL);
+            report_realtime_status(hal.stream.write_all, &hal.stream.report);
+        }
+        return; // withhold the feed - let WDOG1 run out
+    }
+
+    hang_watchdog_feed();
+}
 
 static void protocol_exec_rt_suspend (sys_state_t state);
 
@@ -191,6 +261,11 @@ bool protocol_main_loop (void)
 		system_set_exec_state_flag(EXEC_RT_COMMAND);  // execute any startup up tasks
     }
 
+    if(!wd_installed) {
+        wd_installed = true;
+        task_add_systick(watchdog_systick, NULL);
+    }
+
     // ---------------------------------------------------------------------------------
     // Primary loop! Upon a system abort, this exits back to main() to reset the system.
     // This is also where grblHAL idles while waiting for something to do.
@@ -260,10 +335,12 @@ bool protocol_main_loop (void)
                     hal.stream.write("]" ASCII_EOL);
                     gc_state.last_error = Status_OK;
                 } else if(*line == '$') {// grblHAL '$' system command
+                    watchdog_begin(line);
                     if((gc_state.last_error = system_execute_line(line)) == Status_LimitsEngaged) {
                         system_raise_alarm(Alarm_LimitsEngaged);
                         grbl.report.feedback_message(Message_CheckLimits);
                     }
+                    watchdog_end();
                 } else if(*line == '[' && grbl.on_user_command)
                     gc_state.last_error = grbl.on_user_command(line);
                 else if(state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) { // Everything else is gcode. Block if in alarm, eStop or jog mode.
@@ -281,8 +358,10 @@ bool protocol_main_loop (void)
                 else { // Parse and execute g-code block.
 
 #endif
+                    watchdog_begin(line);
                     if((gc_state.last_error = gc_execute_block(line)) != Status_OK)
                         eol = '\0';
+                    watchdog_end();
                 }
 
                 // Add a short delay for each block processed in Check Mode to
@@ -346,12 +425,17 @@ bool protocol_main_loop (void)
         // Handle extra command (internal stream)
         if(xcommand[0] != '\0') {
 
-            if (xcommand[0] == '$') // grblHAL '$' system command
+            if (xcommand[0] == '$') { // grblHAL '$' system command
+                watchdog_begin(xcommand);
                 system_execute_line(xcommand);
-            else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
+                watchdog_end();
+            } else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
                 grbl.report.status_message(Status_SystemGClock);
-            else // Parse and execute g-code block.
+            else { // Parse and execute g-code block.
+                watchdog_begin(xcommand);
                 gc_execute_block(xcommand);
+                watchdog_end();
+            }
 
             xcommand[0] = '\0';
         }
@@ -439,7 +523,14 @@ FLASHMEM static void protocol_poll_cmd (void)
 
         if ((c == '\n') || (c == '\r')) { // End of line reached
             line[char_counter] = '\0';
-            gc_state.last_error = *line == '\0' ? Status_OK : (*line == '$' ? system_execute_line(line) : Status_SystemGClock);
+            if(*line == '\0')
+                gc_state.last_error = Status_OK;
+            else if(*line == '$') {
+                watchdog_begin(line);
+                gc_state.last_error = system_execute_line(line);
+                watchdog_end();
+            } else
+                gc_state.last_error = Status_SystemGClock;
             char_counter = 0;
             *line = '\0';
             grbl.report.status_message(gc_state.last_error);
