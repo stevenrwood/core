@@ -77,13 +77,68 @@ static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see 
 // = 0.5*(WT+1) sec). A single dispatch legitimately running longer than WATCHDOG_STUCK_MS is common
 // and NOT a hang - $H (homing) routinely takes well over 10s (multiple axes, pull-off, slow seek
 // speeds), and used to get force-reset partway through by the withhold-feed logic below, which treated
-// "one dispatch >5s" as proof of a true hang. Give a dispatch three full hardware-timeout periods
-// before we even start withholding the feed - WDOG1's own already-primed countdown then takes one more
-// ~10s to actually reset the board, so total grace before a real reset is roughly 4x this period.
+// "one dispatch >5s" as proof of a true hang. Give a dispatch N full hardware-timeout periods before we
+// even start withholding the feed - WDOG1's own already-primed countdown then takes one more ~10s to
+// actually reset the board, so total grace before a real reset is roughly (N+1)x this period. N is a
+// $-setting (Setting_UserDefined_9, i.e. $459) rather than a fixed constant because how long a
+// legitimate homing cycle takes is entirely per-machine (seek speeds, travel, axis count) - default 5
+// is a deliberately conservative starting point, tune down once a machine's actual $H time is known.
 #ifndef WATCHDOG_HARDWARE_PERIOD_MS
 #define WATCHDOG_HARDWARE_PERIOD_MS 10000
 #endif
-#define WATCHDOG_STUCK_GRACE_MS (3 * WATCHDOG_HARDWARE_PERIOD_MS)
+#define WATCHDOG_STUCK_GRACE_MULTIPLIER_DEFAULT 5
+
+static uint32_t nvs_address;
+static uint8_t wd_grace_multiplier = WATCHDOG_STUCK_GRACE_MULTIPLIER_DEFAULT;
+
+static void watchdog_settings_restore (void)
+{
+    wd_grace_multiplier = WATCHDOG_STUCK_GRACE_MULTIPLIER_DEFAULT;
+    hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&wd_grace_multiplier, sizeof(wd_grace_multiplier), true);
+}
+
+static void watchdog_settings_load (void)
+{
+    if(hal.nvs.memcpy_from_nvs((uint8_t *)&wd_grace_multiplier, nvs_address, sizeof(wd_grace_multiplier), true) != NVS_TransferResult_OK)
+        watchdog_settings_restore();
+}
+
+static void watchdog_settings_save (void)
+{
+    hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&wd_grace_multiplier, sizeof(wd_grace_multiplier), true);
+}
+
+PROGMEM static const setting_detail_t watchdog_settings[] = {
+    { Setting_UserDefined_9, Group_General, "Hang watchdog grace period", "x hardware timeout", Format_Int8, "##0", "0", "20", Setting_NonCore, &wd_grace_multiplier, NULL, NULL },
+};
+
+PROGMEM static const setting_descr_t watchdog_settings_descr[] = {
+    { Setting_UserDefined_9, "How many WDOG1 hardware-timeout periods (~10s each) a single command dispatch "
+                              "(e.g. $H homing) may legitimately run before the hang watchdog treats it as stuck "
+                              "and lets WDOG1 reset the board. Size to comfortably exceed this machine's actual "
+                              "$H time - too low force-resets mid-homing, too high delays detecting a real hang. "
+                              "Set to 0 to disable the hardware reset entirely - the soft [MSG:WATCHDOG...] log "
+                              "still fires, but WDOG1 is fed unconditionally and the board is never force-reset."
+    },
+};
+
+static setting_details_t watchdog_setting_details = {
+    .settings = watchdog_settings,
+    .n_settings = sizeof(watchdog_settings) / sizeof(setting_detail_t),
+    .descriptions = watchdog_settings_descr,
+    .n_descriptions = sizeof(watchdog_settings_descr) / sizeof(setting_descr_t),
+    .save = watchdog_settings_save,
+    .load = watchdog_settings_load,
+    .restore = watchdog_settings_restore
+};
+
+// Called once from plugins_init.h, before settings are loaded from NVS - mirrors every other small
+// settings-owning module in this codebase (see e.g. webui/login.c).
+void watchdog_settings_init (void)
+{
+    if((nvs_address = nvs_alloc(sizeof(wd_grace_multiplier))))
+        settings_register(&watchdog_setting_details);
+}
 
 static volatile uint32_t wd_start_ms = 0;
 static volatile bool wd_active = false, wd_logged = false, wd_installed = false;
@@ -119,10 +174,12 @@ static void watchdog_end (void)
 // loop is making progress) and, critically, STOPS running if a single dispatch (watchdog_begin
 // called, watchdog_end never reached) blocks the loop from ever calling protocol_execute_realtime
 // again - which is the actual hang this feature exists to catch. Two separate thresholds: the soft
-// log fires once at WATCHDOG_STUCK_MS (early warning, no side effect on the feed), but the feed
-// itself is only withheld once WATCHDOG_STUCK_GRACE_MS has elapsed - three full WDOG1 hardware
-// periods - so WDOG1's own timeout can run out and reset the board only after a dispatch has had
-// generous room to be legitimately long-running (e.g. $H homing), not just slow.
+// log fires once at WATCHDOG_STUCK_MS (early warning, no side effect on the feed), but the feed itself
+// is only withheld once wd_grace_multiplier (Setting_UserDefined_9, $459) hardware-timeout periods have
+// elapsed - so WDOG1's own timeout can run out and reset the board only after a dispatch has had
+// generous, per-machine-tunable room to be legitimately long-running (e.g. $H homing), not just slow.
+// wd_grace_multiplier == 0 disables the hardware reset entirely - the soft log still fires, but the
+// feed is never withheld.
 static void watchdog_systick (void *data)
 {
     if(wd_active) {
@@ -138,7 +195,7 @@ static void watchdog_systick (void *data)
             report_realtime_status(hal.stream.write_all, &hal.stream.report);
         }
 
-        if(stuck_ms >= WATCHDOG_STUCK_GRACE_MS)
+        if(wd_grace_multiplier > 0 && stuck_ms >= wd_grace_multiplier * (uint32_t)WATCHDOG_HARDWARE_PERIOD_MS)
             return; // withhold the feed - let WDOG1 run out
     }
 

@@ -181,6 +181,11 @@
     homing_pulloff_init();
 #endif
 
+    // Hang watchdog grace-period setting ($459) - always registered, not feature-gated (protocol.c's
+    // watchdog is itself unconditional). See protocol.c watchdog_settings_init().
+    extern void watchdog_settings_init (void);
+    watchdog_settings_init();
+
 #if ENCODER_ENABLE
     extern bool encoder_init (void);
     encoder_init();
