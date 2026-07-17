@@ -73,6 +73,18 @@ static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see 
 #define WATCHDOG_STUCK_MS 5000
 #endif
 
+// WDOG1's own hardware timeout is ~10s (WT(19), see hang_watchdog_init in usb_serial_ard.cpp: timeout
+// = 0.5*(WT+1) sec). A single dispatch legitimately running longer than WATCHDOG_STUCK_MS is common
+// and NOT a hang - $H (homing) routinely takes well over 10s (multiple axes, pull-off, slow seek
+// speeds), and used to get force-reset partway through by the withhold-feed logic below, which treated
+// "one dispatch >5s" as proof of a true hang. Give a dispatch three full hardware-timeout periods
+// before we even start withholding the feed - WDOG1's own already-primed countdown then takes one more
+// ~10s to actually reset the board, so total grace before a real reset is roughly 4x this period.
+#ifndef WATCHDOG_HARDWARE_PERIOD_MS
+#define WATCHDOG_HARDWARE_PERIOD_MS 10000
+#endif
+#define WATCHDOG_STUCK_GRACE_MS (3 * WATCHDOG_HARDWARE_PERIOD_MS)
+
 static volatile uint32_t wd_start_ms = 0;
 static volatile bool wd_active = false, wd_logged = false, wd_installed = false;
 static char wd_line[LINE_BUFFER_SIZE];
@@ -106,22 +118,28 @@ static void watchdog_end (void)
 // ISR. So this runs on every idle/normal iteration (feeding WDOG1 is correct and safe there - the
 // loop is making progress) and, critically, STOPS running if a single dispatch (watchdog_begin
 // called, watchdog_end never reached) blocks the loop from ever calling protocol_execute_realtime
-// again - which is the actual hang this feature exists to catch. Feed every tick EXCEPT once a
-// dispatch has been stuck past the soft-log threshold, so WDOG1's own timeout (longer than
-// WATCHDOG_STUCK_MS, see hang_watchdog_init) can run out and reset the board.
+// again - which is the actual hang this feature exists to catch. Two separate thresholds: the soft
+// log fires once at WATCHDOG_STUCK_MS (early warning, no side effect on the feed), but the feed
+// itself is only withheld once WATCHDOG_STUCK_GRACE_MS has elapsed - three full WDOG1 hardware
+// periods - so WDOG1's own timeout can run out and reset the board only after a dispatch has had
+// generous room to be legitimately long-running (e.g. $H homing), not just slow.
 static void watchdog_systick (void *data)
 {
-    if(wd_active && (hal.get_elapsed_ticks() - wd_start_ms) >= WATCHDOG_STUCK_MS) {
-        if(!wd_logged) {
+    if(wd_active) {
+        uint32_t stuck_ms = hal.get_elapsed_ticks() - wd_start_ms;
+
+        if(stuck_ms >= WATCHDOG_STUCK_MS && !wd_logged) {
             wd_logged = true;
             hal.stream.write_all("[MSG:WATCHDOG stuck_ms=");
-            hal.stream.write_all(uitoa(hal.get_elapsed_ticks() - wd_start_ms));
+            hal.stream.write_all(uitoa(stuck_ms));
             hal.stream.write_all(" line=\"");
             hal.stream.write_all(wd_line);
             hal.stream.write_all("\"]" ASCII_EOL);
             report_realtime_status(hal.stream.write_all, &hal.stream.report);
         }
-        return; // withhold the feed - let WDOG1 run out
+
+        if(stuck_ms >= WATCHDOG_STUCK_GRACE_MS)
+            return; // withhold the feed - let WDOG1 run out
     }
 
     hang_watchdog_feed();
