@@ -61,28 +61,27 @@ static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see 
 
 // Defensive diagnostic, not a fix: flags the line/command currently being dispatched (watchdog_begin/_end
 // wrap every system_execute_line/gc_execute_block call below) and how long it has been running. A systick
-// task (watchdog_systick) logs a [MSG:WATCHDOG ...] + a full status report if a single dispatch hasn't
-// returned within WATCHDOG_STUCK_MS. Registered once (wd_installed) the first time protocol_main_loop runs,
-// so it survives soft-reset re-entries without double-registering. Aimed at the same symptom shape as the
-// 2026-07 streamer-thread wedge (hal.stream.read stuck, main loop still spinning but nothing ever
-// completes) - the loop keeps calling protocol_execute_realtime() every iteration even in that class of
-// hang, so a systick task still runs and TX stayed alive in that investigation even though RX was the
-// thing actually stuck - so this should reliably get a report out instead of needing another cold
-// hardware/JTAG dig to even see that something's wrong. Logs once per stall (wd_logged), not every tick.
-#ifndef WATCHDOG_STUCK_MS
-#define WATCHDOG_STUCK_MS 5000
-#endif
+// task (watchdog_systick) logs a [MSG:WATCHDOG ...] + a full status report once the grace period below is
+// used up and WDOG1's own hardware feed is about to be withheld (i.e. only when a reset is now imminent -
+// see watchdog_systick for why an earlier "still running" log was actively misleading). Registered once
+// (wd_installed) the first time protocol_main_loop runs, so it survives soft-reset re-entries without
+// double-registering. Aimed at the same symptom shape as the 2026-07 streamer-thread wedge (hal.stream.read
+// stuck, main loop still spinning but nothing ever completes) - the loop keeps calling
+// protocol_execute_realtime() every iteration even in that class of hang, so a systick task still runs and
+// TX stayed alive in that investigation even though RX was the thing actually stuck - so this should
+// reliably get a report out instead of needing another cold hardware/JTAG dig to even see that something's
+// wrong. Logs once per stall (wd_logged), not every tick.
 
 // WDOG1's own hardware timeout is ~10s (WT(19), see hang_watchdog_init in usb_serial_ard.cpp: timeout
-// = 0.5*(WT+1) sec). A single dispatch legitimately running longer than WATCHDOG_STUCK_MS is common
-// and NOT a hang - $H (homing) routinely takes well over 10s (multiple axes, pull-off, slow seek
-// speeds), and used to get force-reset partway through by the withhold-feed logic below, which treated
-// "one dispatch >5s" as proof of a true hang. Give a dispatch N full hardware-timeout periods before we
-// even start withholding the feed - WDOG1's own already-primed countdown then takes one more ~10s to
-// actually reset the board, so total grace before a real reset is roughly (N+1)x this period. N is a
-// $-setting (Setting_UserDefined_9, i.e. $459) rather than a fixed constant because how long a
-// legitimate homing cycle takes is entirely per-machine (seek speeds, travel, axis count) - default 5
-// is a deliberately conservative starting point, tune down once a machine's actual $H time is known.
+// = 0.5*(WT+1) sec). A single dispatch legitimately running long is common and NOT a hang - $H (homing)
+// routinely takes well over 10s (multiple axes, pull-off, slow seek speeds), and used to get force-reset
+// partway through by the withhold-feed logic below, which treated "one dispatch running long" as proof of
+// a true hang. Give a dispatch N full hardware-timeout periods before we even start withholding the feed -
+// WDOG1's own already-primed countdown then takes one more ~10s to actually reset the board, so total
+// grace before a real reset is roughly (N+1)x this period. N is a $-setting (Setting_UserDefined_9, i.e.
+// $459) rather than a fixed constant because how long a legitimate homing cycle takes is entirely
+// per-machine (seek speeds, travel, axis count) - default 5 is a deliberately conservative starting
+// point, tune down once a machine's actual $H time is known.
 #ifndef WATCHDOG_HARDWARE_PERIOD_MS
 #define WATCHDOG_HARDWARE_PERIOD_MS 10000
 #endif
@@ -173,30 +172,53 @@ static void watchdog_end (void)
 // ISR. So this runs on every idle/normal iteration (feeding WDOG1 is correct and safe there - the
 // loop is making progress) and, critically, STOPS running if a single dispatch (watchdog_begin
 // called, watchdog_end never reached) blocks the loop from ever calling protocol_execute_realtime
-// again - which is the actual hang this feature exists to catch. Two separate thresholds: the soft
-// log fires once at WATCHDOG_STUCK_MS (early warning, no side effect on the feed), but the feed itself
-// is only withheld once wd_grace_multiplier (Setting_UserDefined_9, $459) hardware-timeout periods have
-// elapsed - so WDOG1's own timeout can run out and reset the board only after a dispatch has had
-// generous, per-machine-tunable room to be legitimately long-running (e.g. $H homing), not just slow.
-// wd_grace_multiplier == 0 disables the hardware reset entirely - the soft log still fires, but the
-// feed is never withheld.
+// again - which is the actual hang this feature exists to catch. The log fires exactly once, right as
+// the feed is withheld: earlier revisions logged at a fixed 5s regardless of the (per-machine-tunable,
+// often much longer) grace period, which meant a completely normal long-running dispatch printed an
+// alarming-looking "[MSG:WATCHDOG...]" that meant nothing - the feed was never actually at risk yet.
+// Logging only when the grace period (wd_grace_multiplier x WATCHDOG_HARDWARE_PERIOD_MS,
+// Setting_UserDefined_9/$459) is used up means the message is only ever seen when a reset is now
+// genuinely imminent (WDOG1's own already-primed ~10s countdown takes over from here).
+// wd_grace_multiplier == 0 disables the hardware reset entirely - the feed is never withheld, so this
+// never logs either.
+//
+// EXEMPT while the system is in a state where the OPERATOR, not the main loop, controls the timing:
+// confirmed on real hardware, both of these force-reset the board for no actual hang -
+//   - STATE_HOLD/STATE_TOOL_CHANGE: M0/M1 (gcode.c) and a manual tool change call
+//     protocol_execute_realtime() SYNCHRONOUSLY from inside the SAME gc_execute_block() dispatch
+//     watchdog_begin/_end wrap - the suspend/wait-for-resume loop runs there, so watchdog_end() simply
+//     doesn't fire until Cycle Start, however long that takes (a tool swap can easily exceed the grace
+//     period). The main loop is NOT stuck - it's actively pumping protocol_execute_realtime() the whole
+//     time, which is what implements the wait.
+//   - STATE_ALARM/STATE_ESTOP/STATE_SAFETY_DOOR/STATE_SLEEP: an alarm raised mid-dispatch (e.g. a
+//     soft-limit check inside the line that triggered it) can leave THAT line's watchdog_end() never
+//     reached the same way - the stale in-flight timer then keeps counting through the entire
+//     Alarm/Reset-pending wait and eventually force-resets a machine that is sitting completely safely,
+//     locked out pending the operator's $X/Reset. Forcing a reset here is actively counterproductive:
+//     it discards the alarm state and confuses recovery instead of catching an actual hang.
+// Only STATE_CYCLE/STATE_HOMING/STATE_JOG (and plain idle command dispatch, state_get()==STATE_IDLE)
+// are states where a single dispatch running long is actually suspicious - the watchdog stays fully
+// armed there, unchanged.
 static void watchdog_systick (void *data)
 {
-    if(wd_active) {
+    if(wd_active && (state_get() & (STATE_HOLD|STATE_TOOL_CHANGE|STATE_ALARM|STATE_ESTOP|STATE_SAFETY_DOOR|STATE_SLEEP))) {
+        wd_start_ms = hal.get_elapsed_ticks(); // keep sliding forward - don't log/withhold the instant this state clears either
+        wd_logged = false;
+    } else if(wd_active) {
         uint32_t stuck_ms = hal.get_elapsed_ticks() - wd_start_ms;
 
-        if(stuck_ms >= WATCHDOG_STUCK_MS && !wd_logged) {
-            wd_logged = true;
-            hal.stream.write_all("[MSG:WATCHDOG stuck_ms=");
-            hal.stream.write_all(uitoa(stuck_ms));
-            hal.stream.write_all(" line=\"");
-            hal.stream.write_all(wd_line);
-            hal.stream.write_all("\"]" ASCII_EOL);
-            report_realtime_status(hal.stream.write_all, &hal.stream.report);
-        }
-
-        if(wd_grace_multiplier > 0 && stuck_ms >= wd_grace_multiplier * (uint32_t)WATCHDOG_HARDWARE_PERIOD_MS)
+        if(wd_grace_multiplier > 0 && stuck_ms >= wd_grace_multiplier * (uint32_t)WATCHDOG_HARDWARE_PERIOD_MS) {
+            if(!wd_logged) {
+                wd_logged = true;
+                hal.stream.write_all("[MSG:WATCHDOG grace period (");
+                hal.stream.write_all(uitoa(wd_grace_multiplier));
+                hal.stream.write_all("x hardware timeout, see $459) used up for line=\"");
+                hal.stream.write_all(wd_line);
+                hal.stream.write_all("\" - WDOG1 reset in ~10s unless it recovers]" ASCII_EOL);
+                report_realtime_status(hal.stream.write_all, &hal.stream.report);
+            }
             return; // withhold the feed - let WDOG1 run out
+        }
     }
 
     hang_watchdog_feed();
