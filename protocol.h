@@ -63,4 +63,11 @@ bool protocol_enqueue_realtime_command (uint8_t c);
 bool protocol_enqueue_gcode (char *data);
 void protocol_message (char *message);
 
+// Hang watchdog, execution-side liveness - called only from stepper.c (st_prep_buffer). See the long
+// note at the top of protocol.c: the watchdog deliberately watches whether QUEUED WORK IS ADVANCING,
+// not whether a parser dispatch has returned.
+void watchdog_exec_begin (uint32_t line_number);   // a planner block was dequeued - execution owns progress now
+void watchdog_exec_progress (void);                // a step segment completed - forward progress, restart the clock
+void watchdog_exec_end (void);                     // nothing left to execute - disarm (idle is never a hang)
+
 #endif

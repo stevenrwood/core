@@ -882,8 +882,10 @@ FLASHMEM void st_parking_restore_buffer (void)
 void st_prep_buffer (void)
 {
     // Block step prep buffer, while in a suspend state and there is no suspend motion to execute.
-    if (sys.step_control.end_motion)
+    if (sys.step_control.end_motion) {
+        watchdog_exec_end(); // prep deliberately halted (hold/suspend/end of a system motion) - not a stall
         return;
+    }
 
     while (segment_buffer_head->next != segment_buffer_tail) { // Check if we need to fill the buffer.
 
@@ -894,8 +896,12 @@ void st_prep_buffer (void)
 
             pl_block = sys.step_control.execute_sys_motion ? plan_get_system_motion_block() : plan_get_current_block();
 
-            if (pl_block == NULL)
+            if (pl_block == NULL) {
+                watchdog_exec_end(); // queue empty - nothing to execute, so nothing can be stalled
                 return; // No planner blocks. Exit.
+            }
+
+            watchdog_exec_begin((uint32_t)pl_block->line_number);
 
             if(pl_block->condition.units_per_rev)
                 task_add_delayed(plan_sync_velocity, pl_block, 10);
@@ -1412,6 +1418,11 @@ if(jlog.idx < sizeof(jlog.data) - 1 && prep.ramp_type != Ramp_Cruise) {
 
         // Segment complete! Increment segment pointer, so stepper ISR can immediately execute it.
         segment_buffer_head = segment_buffer_head->next;
+
+        // Forward progress, on the execution side - this is THE hang-watchdog liveness signal. Per segment
+        // rather than per planner block on purpose: one slow G1 across the whole table is a single block
+        // that can legitimately run for many minutes, and must not be mistaken for a stall.
+        watchdog_exec_progress();
 
         // Update the appropriate planner and segment data.
         pl_block->millimeters = mm_remaining;

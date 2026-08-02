@@ -59,29 +59,46 @@ static char xcommand[LINE_BUFFER_SIZE];
 static bool keep_rt_commands = false;
 static bool echo_test_mode = false; // $ECHO=1/0 - RX-stream loopback test, see protocol_main_loop
 
-// Defensive diagnostic, not a fix: flags the line/command currently being dispatched (watchdog_begin/_end
-// wrap every system_execute_line/gc_execute_block call below) and how long it has been running. A systick
-// task (watchdog_systick) logs a [MSG:WATCHDOG ...] + a full status report once the grace period below is
-// used up and WDOG1's own hardware feed is about to be withheld (i.e. only when a reset is now imminent -
-// see watchdog_systick for why an earlier "still running" log was actively misleading). Registered once
-// (wd_installed) the first time protocol_main_loop runs, so it survives soft-reset re-entries without
-// double-registering. Aimed at the same symptom shape as the 2026-07 streamer-thread wedge (hal.stream.read
-// stuck, main loop still spinning but nothing ever completes) - the loop keeps calling
-// protocol_execute_realtime() every iteration even in that class of hang, so a systick task still runs and
-// TX stayed alive in that investigation even though RX was the thing actually stuck - so this should
-// reliably get a report out instead of needing another cold hardware/JTAG dig to even see that something's
-// wrong. Logs once per stall (wd_logged), not every tick.
+// Hang watchdog. Watches the EXECUTION side - the code in stepper.c (st_prep_buffer) that takes blocks off
+// the planner queue and turns them into step segments - and asks one question: is there queued work that
+// has stopped advancing? A systick task (watchdog_systick) logs a [MSG:WATCHDOG ...] + a full status report
+// once the grace period below is used up and WDOG1's own hardware feed is about to be withheld (i.e. only
+// when a reset is now imminent). Registered once (wd_installed) the first time protocol_main_loop runs, so
+// it survives soft-reset re-entries without double-registering. Logs once per stall (wd_logged).
+//
+// THE PARSER KNOWS NOTHING ABOUT THIS, deliberately. Earlier revisions wrapped every
+// system_execute_line/gc_execute_block call below in watchdog_begin(line)/watchdog_end(), i.e. the timer
+// measured "has this dispatch returned yet". That conflates two completely different things - a dispatch
+// not returning, and the machine not making progress - and the difference is not academic:
+//
+//   Confirmed on real hardware 2026-08-02. A job was drilling hole 7 of 12, cutting normally, when the
+//   board was force-reset mid-plunge. The named culprit was "N962M5" - the program's FINAL M5, hundreds of
+//   lines ahead of the cut in progress. Both facts are true at once: the parser runs far ahead of
+//   execution, filling the planner queue, so it had already reached the trailing M5 while the machine was
+//   still physically drilling hole 7. That M5 blocked inside spindle_ramp() (a software-timed PWM
+//   step-down loop, gated on $539 spindle off delay), which cooperatively yields to
+//   protocol_execute_realtime() via delay_sec() - so segment prep, motion and status reports all continued
+//   perfectly normally. NOTHING was hung. But watchdog_end() for that M5 never came, the grace period ran
+//   out, the feed was withheld, and WDOG1 reset a board that was cutting correctly at the time.
+//
+// Tying the timer to execution instead fixes that whole class at the root, and catches a strictly more
+// dangerous failure than the old design ever could: work still queued but the steppers stopped dead
+// mid-cut. Note what is given up - a wedge with an EMPTY queue and an idle machine (e.g. the 2026-07
+// streamer-thread wedge, hal.stream.read stuck) no longer trips this, because an idle machine with nothing
+// queued is indistinguishable from a machine legitimately waiting for the operator. That is the correct
+// trade: nothing is physically at risk in that state, and force-resetting an idle board never helped.
 
 // WDOG1's own hardware timeout is ~10s (WT(19), see hang_watchdog_init in usb_serial_ard.cpp: timeout
-// = 0.5*(WT+1) sec). A single dispatch legitimately running long is common and NOT a hang - $H (homing)
-// routinely takes well over 10s (multiple axes, pull-off, slow seek speeds), and used to get force-reset
-// partway through by the withhold-feed logic below, which treated "one dispatch running long" as proof of
-// a true hang. Give a dispatch N full hardware-timeout periods before we even start withholding the feed -
-// WDOG1's own already-primed countdown then takes one more ~10s to actually reset the board, so total
-// grace before a real reset is roughly (N+1)x this period. N is a $-setting (Setting_UserDefined_9, i.e.
-// $459) rather than a fixed constant because how long a legitimate homing cycle takes is entirely
-// per-machine (seek speeds, travel, axis count) - default 5 is a deliberately conservative starting
-// point, tune down once a machine's actual $H time is known.
+// = 0.5*(WT+1) sec). Give execution N full hardware-timeout periods with NO forward progress before we
+// even start withholding the feed - WDOG1's own already-primed countdown then takes one more ~10s to
+// actually reset the board, so total grace before a real reset is roughly (N+1)x this period. N is a
+// $-setting (Setting_UserDefined_9, i.e. $459) rather than a fixed constant so it can be tuned per machine.
+//
+// This needs far less headroom than it did when the timer measured dispatch duration: the clock is now
+// restarted by every completed step segment, so a slow multi-minute G1, a long $H homing cycle and a
+// deliberately-paused hold all keep it fed continuously instead of racing it. N is really just "how long
+// can queued motion plausibly stall without anything being wrong", which is short. Default 5 is left
+// conservative; it can safely come down a long way.
 #ifndef WATCHDOG_HARDWARE_PERIOD_MS
 #define WATCHDOG_HARDWARE_PERIOD_MS 10000
 #endif
@@ -112,12 +129,12 @@ PROGMEM static const setting_detail_t watchdog_settings[] = {
 };
 
 PROGMEM static const setting_descr_t watchdog_settings_descr[] = {
-    { Setting_UserDefined_9, "How many WDOG1 hardware-timeout periods (~10s each) a single command dispatch "
-                              "(e.g. $H homing) may legitimately run before the hang watchdog treats it as stuck "
-                              "and lets WDOG1 reset the board. Size to comfortably exceed this machine's actual "
-                              "$H time - too low force-resets mid-homing, too high delays detecting a real hang. "
-                              "Set to 0 to disable the hardware reset entirely - the soft [MSG:WATCHDOG...] log "
-                              "still fires, but WDOG1 is fed unconditionally and the board is never force-reset."
+    { Setting_UserDefined_9, "How many WDOG1 hardware-timeout periods (~10s each) queued motion may stop advancing "
+                              "before the hang watchdog treats it as stuck and lets WDOG1 reset the board. The "
+                              "timer is restarted by every completed step segment, so long moves, homing and feed "
+                              "holds all keep it fed - this is really 'how long can queued motion plausibly stall "
+                              "with nothing wrong', which is short. Set to 0 to disable the hardware reset entirely "
+                              "- the soft [MSG:WATCHDOG...] log still fires, but WDOG1 is fed unconditionally."
     },
 };
 
@@ -140,41 +157,54 @@ void watchdog_settings_init (void)
 }
 
 static volatile uint32_t wd_start_ms = 0;
-static volatile bool wd_active = false, wd_logged = false, wd_installed = false;
-static char wd_line[LINE_BUFFER_SIZE];
+static volatile bool wd_armed = false, wd_logged = false, wd_installed = false;
+static volatile uint32_t wd_line_number = 0;
 
-// Hardware backstop for this same diagnostic (Teensy4/iMXRT1062-specific, see usb_serial_ard.cpp):
-// hang_watchdog_arm records the line and feeds WDOG1, hang_watchdog_feed feeds it again once the
-// dispatch returns. Forward progress (a dispatch actually completing) is required to keep the timer
-// fed - if one never returns, WDOG1 resets the board and the next boot's report_crash_if_any() names
-// the line that was in flight. The soft log above still fires first (WATCHDOG_STUCK_MS < WDOG1's
-// timeout) so a stall that eventually clears on its own is visible without forcing a reboot.
+// Hardware backstop (Teensy4/iMXRT1062-specific, see usb_serial_ard.cpp): hang_watchdog_feed feeds
+// WDOG1, hang_watchdog_arm writes a reset-surviving record naming what was in flight (and feeds).
+// watchdog_systick below feeds on every tick unless execution has stalled with work queued; arm is
+// called only at the moment the feed is first withheld, so the next boot's report_crash_if_any() can
+// name the line - see the note at that call site for why it is not armed per block.
 extern void hang_watchdog_arm(const char *line);
 extern void hang_watchdog_feed(void);
 
-static void watchdog_begin (const char *cmd_line)
+// EXECUTION-side liveness, called from stepper.c (st_prep_buffer) - the code that takes blocks OFF the
+// planner queue the parser put them on and turns them into step segments. Nothing here is called by, or
+// known to, the parser.
+//
+// watchdog_exec_begin  - a planner block was just dequeued: execution is now responsible for progress.
+// watchdog_exec_progress - a step segment was just completed: forward progress, restart the clock. Called
+//                        per segment (not per block) so a single legitimately long move - a slow G1 across
+//                        the whole table is ONE planner block that can run for many minutes - keeps the
+//                        watchdog fed the entire time.
+// watchdog_exec_end    - nothing left to execute (planner queue empty, or prep deliberately halted):
+//                        disarm. An idle machine must never be a hang.
+void watchdog_exec_begin (uint32_t line_number)
 {
-    strncpy(wd_line, cmd_line, sizeof(wd_line) - 1);
-    wd_line[sizeof(wd_line) - 1] = '\0';
+    wd_line_number = line_number;
     wd_start_ms = hal.get_elapsed_ticks();
     wd_logged = false;
-    wd_active = true;
-    hang_watchdog_arm(cmd_line);
+    wd_armed = true;
 }
 
-static void watchdog_end (void)
+void watchdog_exec_progress (void)
 {
-    wd_active = false;
+    wd_start_ms = hal.get_elapsed_ticks();
+}
+
+void watchdog_exec_end (void)
+{
+    wd_armed = false;
 }
 
 // task_add_systick tasks are FOREGROUND tasks (foreground_task_ptr) - cooperatively driven from
 // protocol_execute_realtime(), called once per protocol_main_loop iteration, NOT a real hardware
 // ISR. So this runs on every idle/normal iteration (feeding WDOG1 is correct and safe there - the
-// loop is making progress) and, critically, STOPS running if a single dispatch (watchdog_begin
-// called, watchdog_end never reached) blocks the loop from ever calling protocol_execute_realtime
-// again - which is the actual hang this feature exists to catch. The log fires exactly once, right as
+// loop is making progress) and STOPS running entirely if the main loop is wedged so hard it never
+// calls protocol_execute_realtime again - in which case WDOG1 is simply never fed and resets the
+// board on its own, without needing anything here. The log fires exactly once, right as
 // the feed is withheld: earlier revisions logged at a fixed 5s regardless of the (per-machine-tunable,
-// often much longer) grace period, which meant a completely normal long-running dispatch printed an
+// often much longer) grace period, which meant a completely normal long-running operation printed an
 // alarming-looking "[MSG:WATCHDOG...]" that meant nothing - the feed was never actually at risk yet.
 // Logging only when the grace period (wd_grace_multiplier x WATCHDOG_HARDWARE_PERIOD_MS,
 // Setting_UserDefined_9/$459) is used up means the message is only ever seen when a reset is now
@@ -182,39 +212,48 @@ static void watchdog_end (void)
 // wd_grace_multiplier == 0 disables the hardware reset entirely - the feed is never withheld, so this
 // never logs either.
 //
-// EXEMPT while the system is in a state where the OPERATOR, not the main loop, controls the timing:
-// confirmed on real hardware, both of these force-reset the board for no actual hang -
-//   - STATE_HOLD/STATE_TOOL_CHANGE: M0/M1 (gcode.c) and a manual tool change call
-//     protocol_execute_realtime() SYNCHRONOUSLY from inside the SAME gc_execute_block() dispatch
-//     watchdog_begin/_end wrap - the suspend/wait-for-resume loop runs there, so watchdog_end() simply
-//     doesn't fire until Cycle Start, however long that takes (a tool swap can easily exceed the grace
-//     period). The main loop is NOT stuck - it's actively pumping protocol_execute_realtime() the whole
-//     time, which is what implements the wait.
-//   - STATE_ALARM/STATE_ESTOP/STATE_SAFETY_DOOR/STATE_SLEEP: an alarm raised mid-dispatch (e.g. a
-//     soft-limit check inside the line that triggered it) can leave THAT line's watchdog_end() never
-//     reached the same way - the stale in-flight timer then keeps counting through the entire
-//     Alarm/Reset-pending wait and eventually force-resets a machine that is sitting completely safely,
-//     locked out pending the operator's $X/Reset. Forcing a reset here is actively counterproductive:
-//     it discards the alarm state and confuses recovery instead of catching an actual hang.
-// Only STATE_CYCLE/STATE_HOMING/STATE_JOG (and plain idle command dispatch, state_get()==STATE_IDLE)
-// are states where a single dispatch running long is actually suspicious - the watchdog stays fully
-// armed there, unchanged.
+// EXEMPT while the system is in a state where execution is legitimately and deliberately not advancing -
+// the planner queue can still hold blocks in all of these, so without the exemption they would trip:
+//   - STATE_HOLD/STATE_TOOL_CHANGE: a feed hold or M0/M1/manual tool change stops segment prep dead
+//     (sys.step_control.end_motion / the suspend loop) with the rest of the program still queued behind
+//     it, for as long as the operator takes to hit Cycle Start. Not a hang - the machine is parked,
+//     waiting on a human, by design.
+//   - STATE_ALARM/STATE_ESTOP/STATE_SAFETY_DOOR/STATE_SLEEP: same shape - execution is halted pending
+//     the operator's $X/Reset, with queued blocks still present. Force-resetting here is actively
+//     counterproductive: it discards the alarm state and confuses recovery instead of catching a hang.
+// Only STATE_CYCLE/STATE_HOMING/STATE_JOG are states where queued work that stops advancing is actually
+// suspicious - the watchdog stays fully armed there. STATE_IDLE with an empty queue disarms naturally
+// (watchdog_exec_end), so a machine simply sitting idle can never trip this, however long it sits.
 static void watchdog_systick (void *data)
 {
-    if(wd_active && (state_get() & (STATE_HOLD|STATE_TOOL_CHANGE|STATE_ALARM|STATE_ESTOP|STATE_SAFETY_DOOR|STATE_SLEEP))) {
+    if(wd_armed && (state_get() & (STATE_HOLD|STATE_TOOL_CHANGE|STATE_ALARM|STATE_ESTOP|STATE_SAFETY_DOOR|STATE_SLEEP))) {
         wd_start_ms = hal.get_elapsed_ticks(); // keep sliding forward - don't log/withhold the instant this state clears either
         wd_logged = false;
-    } else if(wd_active) {
-        uint32_t stuck_ms = hal.get_elapsed_ticks() - wd_start_ms;
+    } else if(wd_armed) {
+        uint32_t stalled_ms = hal.get_elapsed_ticks() - wd_start_ms;
 
-        if(wd_grace_multiplier > 0 && stuck_ms >= wd_grace_multiplier * (uint32_t)WATCHDOG_HARDWARE_PERIOD_MS) {
+        if(wd_grace_multiplier > 0 && stalled_ms >= wd_grace_multiplier * (uint32_t)WATCHDOG_HARDWARE_PERIOD_MS) {
             if(!wd_logged) {
+                char record[48]; // "exec stalled at line N" (22) + up to 10 digits + NUL
+
                 wd_logged = true;
-                hal.stream.write_all("[MSG:WATCHDOG grace period (");
+
+                // Write the retained (survives-reset) record lazily, HERE, rather than on every dequeue:
+                // hang_watchdog_arm() CRCs a 112-byte buffer and does three dcache flushes, which is far
+                // too expensive to run per planner block in the segment-prep path. Cost is irrelevant once
+                // per stall. Tradeoff: if the board is reset by WDOG1 without this ever running (a total
+                // main-loop wedge, where the systick task itself stops being pumped), the next boot reports
+                // "no valid record" instead of naming a line - the status reports already in the sender's
+                // console log give the last executing line in that case.
+                strcpy(record, "exec stalled at line N");
+                strcat(record, uitoa(wd_line_number));
+                hang_watchdog_arm(record);
+
+                hal.stream.write_all("[MSG:WATCHDOG execution stalled for ");
                 hal.stream.write_all(uitoa(wd_grace_multiplier));
-                hal.stream.write_all("x hardware timeout, see $459) used up for line=\"");
-                hal.stream.write_all(wd_line);
-                hal.stream.write_all("\" - WDOG1 reset in ~10s unless it recovers]" ASCII_EOL);
+                hal.stream.write_all("x hardware timeout (see $459) with work still queued, at line N");
+                hal.stream.write_all(uitoa(wd_line_number));
+                hal.stream.write_all(" - WDOG1 reset in ~10s unless it recovers]" ASCII_EOL);
                 report_realtime_status(hal.stream.write_all, &hal.stream.report);
             }
             return; // withhold the feed - let WDOG1 run out
@@ -432,12 +471,10 @@ bool protocol_main_loop (void)
                     hal.stream.write("]" ASCII_EOL);
                     gc_state.last_error = Status_OK;
                 } else if(*line == '$') {// grblHAL '$' system command
-                    watchdog_begin(line);
                     if((gc_state.last_error = system_execute_line(line)) == Status_LimitsEngaged) {
                         system_raise_alarm(Alarm_LimitsEngaged);
                         grbl.report.feedback_message(Message_CheckLimits);
                     }
-                    watchdog_end();
                 } else if(*line == '[' && grbl.on_user_command)
                     gc_state.last_error = grbl.on_user_command(line);
                 else if(state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) { // Everything else is gcode. Block if in alarm, eStop or jog mode.
@@ -455,10 +492,8 @@ bool protocol_main_loop (void)
                 else { // Parse and execute g-code block.
 
 #endif
-                    watchdog_begin(line);
                     if((gc_state.last_error = gc_execute_block(line)) != Status_OK)
                         eol = '\0';
-                    watchdog_end();
                 }
 
                 // Add a short delay for each block processed in Check Mode to
@@ -523,15 +558,11 @@ bool protocol_main_loop (void)
         if(xcommand[0] != '\0') {
 
             if (xcommand[0] == '$') { // grblHAL '$' system command
-                watchdog_begin(xcommand);
                 system_execute_line(xcommand);
-                watchdog_end();
             } else if (state_get() & (STATE_ALARM|STATE_ESTOP|STATE_JOG)) // Everything else is gcode. Block if in alarm, eStop or jog state.
                 grbl.report.status_message(Status_SystemGClock);
             else { // Parse and execute g-code block.
-                watchdog_begin(xcommand);
                 gc_execute_block(xcommand);
-                watchdog_end();
             }
 
             xcommand[0] = '\0';
@@ -623,9 +654,7 @@ FLASHMEM static void protocol_poll_cmd (void)
             if(*line == '\0')
                 gc_state.last_error = Status_OK;
             else if(*line == '$') {
-                watchdog_begin(line);
                 gc_state.last_error = system_execute_line(line);
-                watchdog_end();
             } else
                 gc_state.last_error = Status_SystemGClock;
             char_counter = 0;
