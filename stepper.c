@@ -882,10 +882,8 @@ FLASHMEM void st_parking_restore_buffer (void)
 void st_prep_buffer (void)
 {
     // Block step prep buffer, while in a suspend state and there is no suspend motion to execute.
-    if (sys.step_control.end_motion) {
-        watchdog_exec_end(); // prep deliberately halted (hold/suspend/end of a system motion) - not a stall
+    if (sys.step_control.end_motion)
         return;
-    }
 
     while (segment_buffer_head->next != segment_buffer_tail) { // Check if we need to fill the buffer.
 
@@ -896,10 +894,8 @@ void st_prep_buffer (void)
 
             pl_block = sys.step_control.execute_sys_motion ? plan_get_system_motion_block() : plan_get_current_block();
 
-            if (pl_block == NULL) {
-                watchdog_exec_end(); // queue empty - nothing to execute, so nothing can be stalled
+            if (pl_block == NULL)
                 return; // No planner blocks. Exit.
-            }
 
             watchdog_exec_begin((uint32_t)pl_block->line_number);
 

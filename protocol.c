@@ -157,7 +157,7 @@ void watchdog_settings_init (void)
 }
 
 static volatile uint32_t wd_start_ms = 0;
-static volatile bool wd_armed = false, wd_logged = false, wd_installed = false;
+static volatile bool wd_logged = false, wd_installed = false;
 static volatile uint32_t wd_line_number = 0;
 
 // Hardware backstop (Teensy4/iMXRT1062-specific, see usb_serial_ard.cpp): hang_watchdog_feed feeds
@@ -172,29 +172,25 @@ extern void hang_watchdog_feed(void);
 // planner queue the parser put them on and turns them into step segments. Nothing here is called by, or
 // known to, the parser.
 //
-// watchdog_exec_begin  - a planner block was just dequeued: execution is now responsible for progress.
-// watchdog_exec_progress - a step segment was just completed: forward progress, restart the clock. Called
-//                        per segment (not per block) so a single legitimately long move - a slow G1 across
-//                        the whole table is ONE planner block that can run for many minutes - keeps the
-//                        watchdog fed the entire time.
-// watchdog_exec_end    - nothing left to execute (planner queue empty, or prep deliberately halted):
-//                        disarm. An idle machine must never be a hang.
+// Both of these only ever push the "last forward progress" timestamp forward; NEITHER arms or disarms
+// anything. Whether a stall is even possible right now is re-derived from observable state on every tick
+// in watchdog_systick, deliberately - see the note there. Anything latched here would be latched by code
+// that stops running the moment the machine goes idle, which is exactly the bug this replaced.
+//
+// watchdog_exec_begin    - a planner block was just dequeued; also records its line number for the report.
+// watchdog_exec_progress - a step segment was just completed. Called per segment (not per block) so a
+//                          single legitimately long move - a slow G1 across the whole table is ONE planner
+//                          block that can run for many minutes - keeps the watchdog fed the entire time.
 void watchdog_exec_begin (uint32_t line_number)
 {
     wd_line_number = line_number;
     wd_start_ms = hal.get_elapsed_ticks();
     wd_logged = false;
-    wd_armed = true;
 }
 
 void watchdog_exec_progress (void)
 {
     wd_start_ms = hal.get_elapsed_ticks();
-}
-
-void watchdog_exec_end (void)
-{
-    wd_armed = false;
 }
 
 // task_add_systick tasks are FOREGROUND tasks (foreground_task_ptr) - cooperatively driven from
@@ -212,24 +208,24 @@ void watchdog_exec_end (void)
 // wd_grace_multiplier == 0 disables the hardware reset entirely - the feed is never withheld, so this
 // never logs either.
 //
-// EXEMPT while the system is in a state where execution is legitimately and deliberately not advancing -
-// the planner queue can still hold blocks in all of these, so without the exemption they would trip:
-//   - STATE_HOLD/STATE_TOOL_CHANGE: a feed hold or M0/M1/manual tool change stops segment prep dead
-//     (sys.step_control.end_motion / the suspend loop) with the rest of the program still queued behind
-//     it, for as long as the operator takes to hit Cycle Start. Not a hang - the machine is parked,
-//     waiting on a human, by design.
-//   - STATE_ALARM/STATE_ESTOP/STATE_SAFETY_DOOR/STATE_SLEEP: same shape - execution is halted pending
-//     the operator's $X/Reset, with queued blocks still present. Force-resetting here is actively
-//     counterproductive: it discards the alarm state and confuses recovery instead of catching a hang.
-// Only STATE_CYCLE/STATE_HOMING/STATE_JOG are states where queued work that stops advancing is actually
-// suspicious - the watchdog stays fully armed there. STATE_IDLE with an empty queue disarms naturally
-// (watchdog_exec_end), so a machine simply sitting idle can never trip this, however long it sits.
+// The stall test is POSITIVE and RE-DERIVED EVERY TICK, never latched: count only while the machine is in
+// a state that should be actively consuming queued motion (STATE_CYCLE/STATE_HOMING/STATE_JOG) AND the
+// planner actually still holds a block. Anything else - idle, held, alarmed, parked in a tool change,
+// door open, asleep, or simply out of queued work - slides the clock forward and feeds unconditionally.
+//
+// This is deliberately not a list of exemptions off a latched "armed" flag. That was the first attempt and
+// it force-reset a healthy machine within the hour, confirmed on real hardware 2026-08-02: the operator
+// paused and pressed Stop after the 4th hole to change a feed, the queue was flushed (Bf:100) and the
+// machine sat Idle - but the flag had been set by the last dequeue (line N382) inside st_prep_buffer(),
+// and st_prep_buffer() stops being called once there is nothing to prep. So nothing ever cleared it, the
+// timestamp never advanced, and WDOG1 reset an idle board 50s later. A disarm that lives inside the code
+// it is meant to disarm cannot run when that code stops - hence: derive, don't latch.
 static void watchdog_systick (void *data)
 {
-    if(wd_armed && (state_get() & (STATE_HOLD|STATE_TOOL_CHANGE|STATE_ALARM|STATE_ESTOP|STATE_SAFETY_DOOR|STATE_SLEEP))) {
-        wd_start_ms = hal.get_elapsed_ticks(); // keep sliding forward - don't log/withhold the instant this state clears either
+    if(!((state_get() & (STATE_CYCLE|STATE_HOMING|STATE_JOG)) && plan_get_current_block())) {
+        wd_start_ms = hal.get_elapsed_ticks(); // keep sliding forward - don't log/withhold the instant this clears either
         wd_logged = false;
-    } else if(wd_armed) {
+    } else {
         uint32_t stalled_ms = hal.get_elapsed_ticks() - wd_start_ms;
 
         if(wd_grace_multiplier > 0 && stalled_ms >= wd_grace_multiplier * (uint32_t)WATCHDOG_HARDWARE_PERIOD_MS) {

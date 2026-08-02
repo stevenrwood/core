@@ -65,9 +65,9 @@ void protocol_message (char *message);
 
 // Hang watchdog, execution-side liveness - called only from stepper.c (st_prep_buffer). See the long
 // note at the top of protocol.c: the watchdog deliberately watches whether QUEUED WORK IS ADVANCING,
-// not whether a parser dispatch has returned.
-void watchdog_exec_begin (uint32_t line_number);   // a planner block was dequeued - execution owns progress now
-void watchdog_exec_progress (void);                // a step segment completed - forward progress, restart the clock
-void watchdog_exec_end (void);                     // nothing left to execute - disarm (idle is never a hang)
+// not whether a parser dispatch has returned. Both calls only push the last-progress timestamp forward;
+// whether a stall is possible at all is re-derived from state each tick in watchdog_systick, not latched.
+void watchdog_exec_begin (uint32_t line_number);   // a planner block was dequeued (records its line number)
+void watchdog_exec_progress (void);                // a step segment completed - forward progress
 
 #endif
