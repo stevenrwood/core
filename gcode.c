@@ -3056,26 +3056,51 @@ status_code_t gc_execute_block (char *block)
 
                 if(!(gc_parser_flags.jog_motion || gc_block.non_modal_command == NonModal_AbsoluteOverride) && (r_axes.mask = (gc_block.modal.g5x_offset.data.rotation == 0.0f ? 0 : (axis_words.mask & (r_around.mask = rotate_axes[gc_block.modal.plane_select].mask))))) {
 
-                    if(r_axes.mask != r_around.mask) {
-                        point_3d_t pos;
-                        memcpy(&pos, gc_state.position, sizeof(point_3d_t));
-                        idx_0 = ffs(r_axes.mask) - 1;
-                        idx_1 = ffs((r_axes.mask ^ r_around.mask) & r_around.mask) - 1;
-                        pos.values[idx_0] -= (gc_state.g92_offset.coord.values[idx_0] + gc_state.modal.tool_length_offset[idx_0]);
-                        pos.values[idx_1] -= (gc_state.g92_offset.coord.values[idx_1] + gc_state.modal.tool_length_offset[idx_1]);
-                        rotate((coord_data_t *)&pos, plane, -gc_block.modal.g5x_offset.data.rotation);
-                        gc_block.values.xyz[idx_1] = pos.values[idx_1] - gc_block.modal.g5x_offset.data.coord.values[idx_1];
+                    if(gc_block.modal.distance_incremental) {
+
+                        // G91: the axis words are DELTAS in the rotated work frame, not positions, so
+                        // rotating them into machine space is the whole job. The absolute path below
+                        // adds the g5x origin before rotating, which is right for a position and wrong
+                        // for a delta - doing it here would add rotate(origin) to every incremental
+                        // target. For the same reason an unnamed plane axis cannot be reconstructed
+                        // from gc_state.position: as a delta it is simply zero. It must still be
+                        // marked present, because under rotation a move along one work axis has a
+                        // component on BOTH machine axes, and an axis left out of axis_words would
+                        // instead be pinned to its current position and swallow that component.
+                        if(r_axes.mask != r_around.mask)
+                            gc_block.values.xyz[ffs((r_axes.mask ^ r_around.mask) & r_around.mask) - 1] = 0.0f;
+
                         axis_words.mask |= r_around.mask;
-                    } else {
+
                         idx_0 = ffs(r_around.mask) - 1;
-                        bit_false(r_around.mask, bit(idx_0));   // clear the FIRST rotation axis to find the second (was bit(idx) - a stale loop var, which mis-set idx_1 -> the second axis's WCS offset got applied twice -> false soft-limit on rotated G54 XY moves)
+                        bit_false(r_around.mask, bit(idx_0));
                         idx_1 = ffs(r_around.mask) - 1;
+
+                        rotate((coord_data_t *)gc_block.values.xyz, plane, gc_block.modal.g5x_offset.data.rotation);
+
+                    } else {
+
+                        if(r_axes.mask != r_around.mask) {
+                            point_3d_t pos;
+                            memcpy(&pos, gc_state.position, sizeof(point_3d_t));
+                            idx_0 = ffs(r_axes.mask) - 1;
+                            idx_1 = ffs((r_axes.mask ^ r_around.mask) & r_around.mask) - 1;
+                            pos.values[idx_0] -= (gc_state.g92_offset.coord.values[idx_0] + gc_state.modal.tool_length_offset[idx_0]);
+                            pos.values[idx_1] -= (gc_state.g92_offset.coord.values[idx_1] + gc_state.modal.tool_length_offset[idx_1]);
+                            rotate((coord_data_t *)&pos, plane, -gc_block.modal.g5x_offset.data.rotation);
+                            gc_block.values.xyz[idx_1] = pos.values[idx_1] - gc_block.modal.g5x_offset.data.coord.values[idx_1];
+                            axis_words.mask |= r_around.mask;
+                        } else {
+                            idx_0 = ffs(r_around.mask) - 1;
+                            bit_false(r_around.mask, bit(idx_0));   // clear the FIRST rotation axis to find the second (was bit(idx) - a stale loop var, which mis-set idx_1 -> the second axis's WCS offset got applied twice -> false soft-limit on rotated G54 XY moves)
+                            idx_1 = ffs(r_around.mask) - 1;
+                        }
+
+                        gc_block.values.xyz[plane.axis_0] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_0];
+                        gc_block.values.xyz[plane.axis_1] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_1];
+
+                        rotate((coord_data_t *)gc_block.values.xyz, plane, gc_block.modal.g5x_offset.data.rotation);
                     }
-
-                    gc_block.values.xyz[plane.axis_0] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_0];
-                    gc_block.values.xyz[plane.axis_1] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_1];
-
-                    rotate((coord_data_t *)gc_block.values.xyz, plane, gc_block.modal.g5x_offset.data.rotation);
                 }
 #endif
 
