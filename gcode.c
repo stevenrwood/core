@@ -4258,8 +4258,18 @@ status_code_t gc_execute_block (char *block)
 
 #ifdef ROTATION_ENABLE
 
-                    if(gc_state.modal.g5x_offset.data.rotation != 0.0f &&
-                        gc_state.modal.g5x_offset.data.rotation != coord_system.data.rotation) {
+                    // The two halves below are a PAIR: machine -> work through the OLD rotation, then
+                    // work -> machine through the NEW one. Both add the same (old) g5x offset, so the
+                    // offsets cancel and the net effect is a rotation by (new - old) about machine zero.
+                    // Running either half alone leaves gc_state.position in the wrong frame, and the
+                    // next move that leaves an axis unnamed carries that corrupt value forward - a bare
+                    // G53 G0 Z0 lift then rapids to the work origin. So gate BOTH on the same test:
+                    // did the rotation actually change? Guarding them independently (old != 0 && old !=
+                    // new for the first, new != 0 for the second) ran half a transform whenever a
+                    // rotation was cleared, set from zero, or merely rewritten unchanged.
+                    bool rotation_changed = gc_state.modal.g5x_offset.data.rotation != coord_system.data.rotation;
+
+                    if(rotation_changed) {
 
                         gc_state.position[plane.axis_0] -= (gc_state.g92_offset.coord.values[plane.axis_0] + gc_state.modal.tool_length_offset[plane.axis_0]);
                         gc_state.position[plane.axis_1] -= (gc_state.g92_offset.coord.values[plane.axis_1] + gc_state.modal.tool_length_offset[plane.axis_1]);
@@ -4270,7 +4280,7 @@ status_code_t gc_execute_block (char *block)
 
                     memcpy(&gc_state.modal.g5x_offset.data, &coord_system.data, sizeof(coord_system_data_t));
 
-                    if(gc_state.modal.g5x_offset.data.rotation != 0.0f) {
+                    if(rotation_changed) {
                         gc_state.position[plane.axis_0] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_0];
                         gc_state.position[plane.axis_1] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_1];
                         rotate((coord_data_t *)gc_state.position, plane, gc_state.modal.g5x_offset.data.rotation);
