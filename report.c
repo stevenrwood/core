@@ -1474,8 +1474,20 @@ void report_realtime_status (stream_write_ptr stream_write, status_report_tracki
             stream_write("|WCO:");
             stream_write(get_axis_values(wco));
 #ifdef ROTATION_ENABLE
-//            stream_write(":");
-//            stream_write(ftoa(gc_state.modal.g5x_offset.data.rotation, 2));
+            // Rotation is a property of the work frame, not a component of the WCO vector: WCO is a
+            // plain per-axis sum (g5x + g92 + TLO) and no vector can encode an affine transform. So
+            // it goes in a field of its own rather than being appended to WCO - a client that knows
+            // WCSROT (advertised by $I) applies it, one that does not sees an unchanged WCO and
+            // behaves exactly as before.
+            // Emitted whenever WCO is, INCLUDING when zero: an absent field means "firmware without
+            // this feature", which is not the same as "rotation is zero", and a client that cannot
+            // tell those apart will keep applying a stale rotation after one is cleared.
+            // Degrees, matching $#. The 4 decimals are not cosmetic - a consumer reconstructing the
+            // work frame rotates about MACHINE zero, so the quantisation becomes a position error of
+            // (rounding in radians) x (distance from machine zero). At 2 decimals that is +-0.055 mm
+            // at 631 mm out, which is a measured bench residual, not a theoretical one.
+            stream_write("|WCSRot:");
+            stream_write(ftoa(gc_state.modal.g5x_offset.data.rotation * DEGRAD, 4));
 #endif
         }
 
