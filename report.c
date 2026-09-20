@@ -651,7 +651,7 @@ FLASHMEM void report_ngc_parameters (void)
 #ifdef ROTATION_ENABLE
             if(idx < N_WorkCoordinateSystems) {
                 hal.stream.write(":");
-                hal.stream.write(ftoa(offset.rotation * DEGRAD, 2));
+                hal.stream.write(ftoa(offset.rotation * DEGRAD, 4));
             }
 #endif
             hal.stream.write("]" ASCII_EOL);
