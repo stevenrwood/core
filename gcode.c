@@ -4281,40 +4281,28 @@ status_code_t gc_execute_block (char *block)
                 // Update system coordinate system if currently active.
                 if(gc_state.modal.g5x_offset.id == coord_system.id) {
 
-#ifdef ROTATION_ENABLE
-
-                    // The two halves below are a PAIR: machine -> work through the OLD rotation, then
-                    // work -> machine through the NEW one. Both add the same (old) g5x offset, so the
-                    // offsets cancel and the net effect is a rotation by (new - old) about machine zero.
-                    // Running either half alone leaves gc_state.position in the wrong frame, and the
-                    // next move that leaves an axis unnamed carries that corrupt value forward - a bare
-                    // G53 G0 Z0 lift then rapids to the work origin. So gate BOTH on the same test:
-                    // did the rotation actually change? Guarding them independently (old != 0 && old !=
-                    // new for the first, new != 0 for the second) ran half a transform whenever a
-                    // rotation was cleared, set from zero, or merely rewritten unchanged.
-                    bool rotation_changed = gc_state.modal.g5x_offset.data.rotation != coord_system.data.rotation;
-
-                    if(rotation_changed) {
-
-                        gc_state.position[plane.axis_0] -= (gc_state.g92_offset.coord.values[plane.axis_0] + gc_state.modal.tool_length_offset[plane.axis_0]);
-                        gc_state.position[plane.axis_1] -= (gc_state.g92_offset.coord.values[plane.axis_1] + gc_state.modal.tool_length_offset[plane.axis_1]);
-                        rotate((coord_data_t *)&gc_state.position, plane, -gc_block.modal.g5x_offset.data.rotation);
-                        gc_state.position[plane.axis_0] -= gc_block.modal.g5x_offset.data.coord.values[plane.axis_0];
-                        gc_state.position[plane.axis_1] -= gc_block.modal.g5x_offset.data.coord.values[plane.axis_1];
-                    }
-
+                    // NOTE: a ROTATION_ENABLE build used to re-frame gc_state.position here, rotating
+                    // it by (new - old) about machine zero whenever a G10 L2 changed the rotation of
+                    // the ACTIVE coordinate system. That transform was wrong and is deliberately gone;
+                    // writing the offset data is all this needs to do, in every build.
+                    //
+                    // gc_state.position is MACHINE coordinates, and editing a coordinate system moves
+                    // no machine. The proof is in this file: the pre-block reconstructs an unnamed
+                    // plane axis's WORK value from it by (g92 + TLO) subtract, rotate(-rotation), g5x
+                    // subtract - a machine->work conversion, so its input is machine. Rotating it on a
+                    // G10 L2 makes the parser believe the machine is elsewhere, and the next move that
+                    // leaves a plane axis unnamed drives it there: a bare G53 G0 Z0 lift would rapid
+                    // in X/Y. Measured at 1.07 mm on the bench.
+                    //
+                    // Its siblings all disagreed with it, which is the real argument:
+                    //   - gc_clear_offset() zeroes the active system's rotation by memcpy and never
+                    //     touches gc_state.position, so clearing via G59.x reset was already free
+                    //     while clearing the identical rotation via G10 L2 R0 cost 1.07 mm;
+                    //   - changing coordinate DATA without changing rotation left the parser alone,
+                    //     and that is right - the position's WORK coordinates change, the machine
+                    //     stays. A rotation change is no different;
+                    //   - the non-rotation build never had a counterpart to it at all.
                     memcpy(&gc_state.modal.g5x_offset.data, &coord_system.data, sizeof(coord_system_data_t));
-
-                    if(rotation_changed) {
-                        gc_state.position[plane.axis_0] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_0];
-                        gc_state.position[plane.axis_1] += gc_block.modal.g5x_offset.data.coord.values[plane.axis_1];
-                        rotate((coord_data_t *)gc_state.position, plane, gc_state.modal.g5x_offset.data.rotation);
-                        gc_state.position[plane.axis_0] += (gc_state.g92_offset.coord.values[plane.axis_0] + gc_state.modal.tool_length_offset[plane.axis_0]);
-                        gc_state.position[plane.axis_1] += (gc_state.g92_offset.coord.values[plane.axis_1] + gc_state.modal.tool_length_offset[plane.axis_1]);
-                    }
-#else
-                    memcpy(&gc_state.modal.g5x_offset.data, &coord_system.data, sizeof(coord_system_data_t));
-#endif
                     system_flag_wco_change();
                 }
             }
