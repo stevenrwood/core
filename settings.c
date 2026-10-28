@@ -2770,18 +2770,59 @@ FLASHMEM void settings_write_coord_data (coord_system_id_t id, coord_system_data
 }
 
 // Read selected coordinate data from persistent storage.
+//
+// A failed read must NOT be allowed to destroy what is stored. The previous version zeroed the
+// record and wrote it straight back, so a checksum failure - including one caused by a build whose
+// coord_system_data_t has a different size or stride, which changes the address arithmetic below -
+// overwrote real work offsets during what the caller believes is a READ, before anything had
+// reported a problem. Observed 2026-10-27: a simulator built with different options produced
+// error:7 and a zeroed [G54:], and the offsets survived only because the sender happened to hold
+// its own copy and wrote them back.
+//
+// So the two failure cases are now separated:
+//
+//  - BLANK (never written) must still be initialised. It fails this read forever otherwise, and
+//    report_ngc_parameters() bails out on the first failure, which would truncate $# permanently.
+//  - NOT BLANK but failing its checksum is corrupt, or is another layout's data. Refuse it: return
+//    false with a zero vector for the caller and leave the stored bytes alone. The refusal is not
+//    silent - every caller that checks the result reports Status_SettingReadFail (error:7).
 FLASHMEM bool settings_read_coord_data (coord_system_id_t id, coord_system_data_t *data)
 {
     assert(id <= N_CoordinateSystems);
 
-    if(!(hal.nvs.type != NVS_None && hal.nvs.memcpy_from_nvs((uint8_t *)data, NVS_ADDR_PARAMETERS + id * (sizeof(coord_system_data_t) + NVS_CRC_BYTES), sizeof(coord_system_data_t), true) == NVS_TransferResult_OK)) {
-        // Reset with zero vector
-        memset(data, 0, sizeof(coord_system_data_t));
-        settings_write_coord_data(id, data);
-        return false;
+    uint32_t addr = NVS_ADDR_PARAMETERS + id * (sizeof(coord_system_data_t) + NVS_CRC_BYTES);
+
+    if(hal.nvs.type != NVS_None && hal.nvs.memcpy_from_nvs((uint8_t *)data, addr, sizeof(coord_system_data_t), true) == NVS_TransferResult_OK)
+        return true;
+
+    // Re-read without the checksum to inspect the bytes. `data` is scratch here - it is zeroed
+    // below either way. If the raw read is not possible the record is treated as blank, which is
+    // the old behaviour: with no readable storage there is nothing to protect, and when
+    // hal.nvs.type is NVS_None the write below is a no-op anyway.
+    bool blank = true;
+
+    if(hal.nvs.type != NVS_None && hal.nvs.memcpy_from_nvs((uint8_t *)data, addr, sizeof(coord_system_data_t), false) == NVS_TransferResult_OK) {
+
+        uint8_t *p = (uint8_t *)data;
+        uint_fast16_t i = sizeof(coord_system_data_t);
+
+        // Erased flash reads 0xff, a zeroed EEPROM emulation reads 0x00 - neither is real data.
+        // An all-zero record that was genuinely written has a valid checksum and never gets here.
+        while(i--) {
+            if(!(*p == 0 || *p == 0xff)) {
+                blank = false;
+                break;
+            }
+            p++;
+        }
     }
 
-    return true;
+    memset(data, 0, sizeof(coord_system_data_t)); // Callers rely on a zero vector on failure.
+
+    if(blank)
+        settings_write_coord_data(id, data);
+
+    return false;
 }
 
 #if N_TOOLS
