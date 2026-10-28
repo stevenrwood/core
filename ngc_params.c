@@ -470,11 +470,16 @@ FLASHMEM float ngc_named_param_get_by_id (ncg_name_param_id_t id)
     switch(id) {
 
         case NGCParam_vmajor:
-            value = 1.1f;
+            // Was the literal 1.1f - the grbl dialect, not a major version, and it made
+            // #<_vmajor>/#<_vminor> jointly meaningless (1.1 and a build date).
+            value = (float)FIRMWARE_VERSION_MAJOR;
             break;
 
         case NGCParam_vminor:
-            value = (float)(GRBL_BUILD - 20000000);
+            // Was the hand-typed build date (GRBL_BUILD - 20000000, e.g. 260712). Now the
+            // firmware's own minor version. Checked before changing: nothing in the macro set or
+            // in ioSender reads #<_vminor> or #<_vmajor>.
+            value = (float)FIRMWARE_VERSION_MINOR;
             break;
 
         case NGCParam_line:

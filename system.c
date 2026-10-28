@@ -687,11 +687,11 @@ FLASHMEM static status_code_t output_all_build_info (sys_state_t state, char *ar
 
 FLASHMEM static status_code_t settings_downgrade (sys_state_t state, char *args)
 {
-    settings.version.build = settings.version.build == 0 ? (GRBL_BUILD - 20000000UL) : 0;
-
-    if((settings.flags.settings_downgrade = settings.version.build == 0)) {
-
-    }
+    // Toggles the flag that suppresses the legacy NVS migration pass in settings_init(), for going
+    // back to older firmware. It used to do this indirectly by flipping version.build between 0
+    // and the compiled build date, which no longer exists - and version.build now means "written
+    // by the old scheme, not yet migrated", so overwriting it here would destroy that signal.
+    settings.flags.settings_downgrade = !settings.flags.settings_downgrade;
 
     settings_write_global();
 

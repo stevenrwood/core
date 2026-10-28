@@ -326,10 +326,14 @@ FLASHMEM static void report_init_message (stream_write_ptr write)
 {
     hal.stream.report.override_counter = hal.stream.report.wco_counter = 0;
 
+    // The version here is now this FIRMWARE's own (git-tag derived), not the frozen "1.1f" grbl
+    // dialect literal. A sender identifying the controller should key on [FIRMWARE:grblHAL] from
+    // $I, which is explicit about it; sniffing a version out of the banner never distinguished two
+    // builds anyway, since the literal was the same for every one of them.
 #if COMPATIBILITY_LEVEL == 0
-    write(ASCII_EOL "GrblHAL " GRBL_VERSION " ['$' or '$HELP' for help]" ASCII_EOL);
+    write(ASCII_EOL "GrblHAL " FIRMWARE_VERSION " ['$' or '$HELP' for help]" ASCII_EOL);
 #else
-    write(ASCII_EOL "Grbl " GRBL_VERSION " ['$' for help]" ASCII_EOL);
+    write(ASCII_EOL "Grbl " FIRMWARE_VERSION " ['$' for help]" ASCII_EOL);
 #endif
 }
 
@@ -883,9 +887,13 @@ FLASHMEM void report_build_info (char *line, bool extended)
 {
     char buf[100];
 
-    hal.stream.write("[VER:" GRBL_VERSION ".");
-    hal.stream.write(uitoa(GRBL_BUILD));
-    hal.stream.write(":");
+    // [VER:<firmware version>:<stored build info line>]
+    //
+    // The tag is kept because every client looks for it, but the value is now the firmware's own
+    // git-tag-derived version instead of "<grbl dialect>.<hand-typed date>". A client that wants to
+    // compare versions numerically should parse this; one that wants to know exactly which binary
+    // it is talking to should read [BUILD:...] further down, which carries branch, sha and dirty.
+    hal.stream.write("[VER:" FIRMWARE_VERSION ":");
     hal.stream.write(line);
     hal.stream.write("]" ASCII_EOL);
 

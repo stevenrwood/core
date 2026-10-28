@@ -37,12 +37,43 @@
 #include "config.h"
 
 // grblHAL versioning system
-#if COMPATIBILITY_LEVEL == 0
-#define GRBL_VERSION "1.1f"
-#else
-#define GRBL_VERSION "1.1f"
+//
+// GRBL_VERSION ("1.1f") and GRBL_BUILD (a hand-typed YYYYMMDD) were DELETED on 2026-10-28.
+// Neither answered a question anyone actually asked:
+//
+//  - GRBL_BUILD was edited by hand, so it did not move when the code moved. Two builds of the
+//    same core tip with different compile options shared it exactly, which is how an
+//    option-mismatched build was able to present as identical firmware while laying out NVS
+//    differently. It was also doing a second, unrelated job: keying the settings migration in
+//    settings.c, which tied the storage format to a firmware date for no reason.
+//  - GRBL_VERSION was a frozen literal that had not changed in years. It described the grbl
+//    dialect, not this firmware, so it could not tell two builds apart either.
+//
+// They are replaced by FIRMWARE_VERSION / FIRMWARE_VERSION_NUM, DERIVED FROM A GIT TAG by the
+// driver's build script (scripts/touch_build_stamp.py -> build_stamp.h), alongside the sha and
+// dirty flag already in BUILD_TIMESTAMP. Nothing here is hand-maintained any more.
+//
+// NVS layout versioning is deliberately SEPARATE - see SETTINGS_VERSION in settings.h. A storage
+// format and a firmware release are different things and must not share a number: a git-derived
+// firmware version changes on every commit, and keying NVS migration on that would rewrite all of
+// storage on every single flash.
+//
+// The include is optional so core still builds where no driver generates the header - the
+// Simulator, or a driver that has not adopted the script. That case reports 0.0.0, which reads as
+// "unversioned build" rather than claiming a version it does not have.
+#if defined(__has_include)
+  #if __has_include("build_stamp.h")
+    #include "build_stamp.h"
+  #endif
 #endif
-#define GRBL_BUILD 20260712
+
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION_MAJOR 0
+#define FIRMWARE_VERSION_MINOR 0
+#define FIRMWARE_VERSION_PATCH 0
+#define FIRMWARE_VERSION "0.0.0"
+#define FIRMWARE_VERSION_NUM (0L)
+#endif
 
 #define GRBL_URL "https://github.com/grblHAL"
 

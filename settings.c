@@ -60,7 +60,10 @@ const settings_restore_t settings_all = {
 PROGMEM static const settings_t defaults = {
 
     .version.id = SETTINGS_VERSION,
-    .version.build = (GRBL_BUILD - 20000000UL),
+    // version.build is no longer a firmware build date. It is kept only so an NVS image written by
+    // the OLD scheme can still be recognised and migrated once - see the legacy pass in
+    // settings_init(). A fresh image is written with 0, meaning "already in the current scheme".
+    .version.build = 0,
 
 #if DEFAULT_LASER_MODE
     .mode = Mode_Laser,
@@ -3770,7 +3773,19 @@ FLASHMEM void settings_init (void)
 #endif
     setting_remove_elements(Setting_ProbingFlags, mask, true);
 
-    if(!settings.flags.settings_downgrade && settings.version.build != (GRBL_BUILD - 20000000UL)) {
+    // Legacy NVS migration, run ONCE per stored image.
+    //
+    // This used to fire whenever the stored version.build differed from the compiled GRBL_BUILD,
+    // which tied the STORAGE format to a FIRMWARE date. That coupling cannot survive a git-derived
+    // firmware version: it changes on every commit, so the test would be true on every flash and
+    // this block would rewrite all of NVS every time. The storage format and the firmware release
+    // are separate concerns - see the note in grbl.h.
+    //
+    // So the test is now on the stored value alone. A non-zero version.build means the image was
+    // written by the old date-stamped scheme and has not been migrated yet; the fixups below apply
+    // to anything at or before build 250102. Writing 0 marks it migrated, and this never runs
+    // again for that image. $DWNGRD still suppresses it, for going back to older firmware.
+    if(!settings.flags.settings_downgrade && settings.version.build != 0) {
 
         if(settings.version.build <= 250102) {
 //            settings.spindle.on_delay = settings.safety_door.spindle_on_delay * 1000.0f;
@@ -3781,7 +3796,7 @@ FLASHMEM void settings_init (void)
             }
         }
 
-        settings.version.build = (GRBL_BUILD - 20000000UL);
+        settings.version.build = 0;
 
         global_settings.save();
     }
