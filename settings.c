@@ -57,9 +57,58 @@ const settings_restore_t settings_all = {
     .driver_parameters = SETTINGS_RESTORE_DRIVER_PARAMETERS
 };
 
+/* In the configuration where NVS_ADDR_PARAMETERS is the FIXED 512 (see nvs.h), nothing relates that
+   address to sizeof(settings_t) - so a settings_t that grows past the gap silently writes over the
+   first coordinate system record, and the only symptom is corrupted work offsets. Make it a build
+   failure instead.
+
+   The other configuration derives the address from the size, so this is trivially true there; the
+   fixed case is the one that needed a guard. Measured when added, 3-axis: sizeof(settings_t) 420,
+   so 1 + 420 + 2 = 423 against 512, leaving 89 bytes spare. */
+_Static_assert(NVS_ADDR_GLOBAL + sizeof(settings_t) + NVS_CRC_BYTES <= NVS_ADDR_PARAMETERS,
+               "settings_t has outgrown the space before NVS_ADDR_PARAMETERS - it would overwrite "
+               "the first coordinate system record. Shrink it, or raise NVS_ADDR_PARAMETERS and "
+               "provide an NVS migration for the move.");
+
+/*! \brief The layout fingerprint.
+
+A multiplicative mix of the things that decide where records live and how long they are. It has to
+be a compile-time constant expression so the PROGMEM defaults below can carry it, which rules out a
+loop - hence the explicit terms rather than a hash function.
+
+What goes in, and why each term earns its place:
+
+ - sizeof(settings_t)          - the global record's own length, and in the >5-axis configuration
+                                 the base of NVS_ADDR_PARAMETERS, so it moves everything after it.
+ - sizeof(coord_system_data_t) - the record length AND the stride through the parameters area. This
+                                 is the term that catches the mismatch that started all of this:
+                                 ROTATION_ENABLE adds a field, so both change together.
+ - sizeof(stored_line_t)       - the startup-block and build-info record length.
+ - N_AXIS, N_CoordinateSystems, N_STARTUP_LINE - record counts; they size whole regions.
+ - NVS_CRC_BYTES               - sits between every record, so it shifts all of them.
+
+What is deliberately NOT in it: the firmware version. Including that would make every build a layout
+change, which is the coupling this work removed.
+*/
+#define SETTINGS_LAYOUT_ID ( \
+      2166136261UL \
+    ^ ((uint32_t)sizeof(settings_t)             * 16777619UL) \
+    ^ ((uint32_t)sizeof(coord_system_data_t)    * 2246822519UL) \
+    ^ ((uint32_t)sizeof(stored_line_t)          * 3266489917UL) \
+    ^ ((uint32_t)N_AXIS                         * 668265263UL) \
+    ^ ((uint32_t)N_CoordinateSystems            * 374761393UL) \
+    ^ ((uint32_t)N_STARTUP_LINE                 * 2654435761UL) \
+    ^ ((uint32_t)NVS_CRC_BYTES                  * 1540483477UL) )
+
 PROGMEM static const settings_t defaults = {
 
     .version.id = SETTINGS_VERSION,
+    .version_minor = SETTINGS_VERSION_MINOR,
+    // Little-endian, same order settings_layout_id_stored() reads back.
+    .layout_id = { (uint8_t)(SETTINGS_LAYOUT_ID),
+                   (uint8_t)(SETTINGS_LAYOUT_ID >> 8),
+                   (uint8_t)(SETTINGS_LAYOUT_ID >> 16),
+                   (uint8_t)(SETTINGS_LAYOUT_ID >> 24) },
     // version.build is no longer a firmware build date. It is kept only so an NVS image written by
     // the OLD scheme can still be recognised and migrated once - see the legacy pass in
     // settings_init(). A fresh image is written with 0, meaning "already in the current scheme".
@@ -2258,8 +2307,35 @@ FLASHMEM static void sanity_check (void)
     settings.control_disable_pullup.mask &= ~limits_override.mask;
 }
 
+FLASHMEM uint32_t settings_layout_id (void)
+{
+    return (uint32_t)SETTINGS_LAYOUT_ID;
+}
+
+FLASHMEM uint32_t settings_layout_id_stored (const settings_t *s)
+{
+    return (uint32_t)s->layout_id[0]
+         | ((uint32_t)s->layout_id[1] << 8)
+         | ((uint32_t)s->layout_id[2] << 16)
+         | ((uint32_t)s->layout_id[3] << 24);
+}
+
+FLASHMEM void settings_layout_id_set (settings_t *s)
+{
+    uint32_t id = (uint32_t)SETTINGS_LAYOUT_ID;
+
+    s->version_minor = SETTINGS_VERSION_MINOR;
+    s->layout_id[0]  = (uint8_t)id;
+    s->layout_id[1]  = (uint8_t)(id >> 8);
+    s->layout_id[2]  = (uint8_t)(id >> 16);
+    s->layout_id[3]  = (uint8_t)(id >> 24);
+}
+
 // Read global settings from persistent storage.
 // Checks version-byte of non-volatile storage and global settings copy.
+//
+// 🔴 C1 of 3: UNCHANGED on purpose. The reworked version with the migration chain is C2, and it is
+// the prime suspect for the 2026-10-28 brick - so it goes in on its own, instrumented.
 FLASHMEM bool read_global_settings (void)
 {
     bool ok = hal.nvs.type != NVS_None && SETTINGS_VERSION == hal.nvs.get_byte(0) && hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK;
