@@ -273,7 +273,19 @@ FLASHMEM bool nvs_buffer_init (void)
 
         // If no physical storage available or if NVS import fails copy default settings to RAM
         // and write out to physical storage when available.
-        if(physical_nvs.type == NVS_None || ram_get_byte(0) != SETTINGS_VERSION) {
+        //
+        // 🔴 This runs BEFORE settings_init(), so it is the gate that decides whether a stored
+        // image ever reaches the migration chain at all. A strict `!= SETTINGS_VERSION` test wiped
+        // every older image here - defaults restored and written straight back to flash - and
+        // settings_init()'s migration would then find a current, default image and have nothing to
+        // do. The settings were already gone, silently, and the only clue was error:7.
+        //
+        // So let a MIGRATABLE major through untouched and leave the decision to read_global_settings().
+        // If it cannot migrate after all, it returns false and settings_init() restores defaults
+        // and reports - the same outcome as before, just arrived at by the code that knows.
+        if(physical_nvs.type == NVS_None ||
+            !(ram_get_byte(0) == SETTINGS_VERSION_MAJOR ||
+              (ram_get_byte(0) >= SETTINGS_VERSION_MIGRATABLE_MIN && ram_get_byte(0) < SETTINGS_VERSION_MAJOR))) {
             settings_restore(settings_all);
             if(physical_nvs.type == NVS_Flash)
                 physical_nvs.memcpy_to_flash(nvsbuffer.addr);

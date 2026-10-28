@@ -897,6 +897,26 @@ FLASHMEM void report_build_info (char *line, bool extended)
     hal.stream.write(line);
     hal.stream.write("]" ASCII_EOL);
 
+    // [NVSVER:<major>.<minor>-<layout fingerprint>]
+    //
+    // "Which NVS layout does this controller expect?" was previously unanswerable over the wire -
+    // SETTINGS_VERSION appeared nowhere in any report, so an option-mismatched binary looked
+    // identical to the right one until it had already zeroed something. The fingerprint is the half
+    // that matters: it changes when a record moves, whether or not anyone bumped a version.
+    //
+    // Decimal, not hex: core has no hex helper and this is only ever compared for equality, so it
+    // is not worth pulling sprintf into report.c for the sake of convention.
+    //
+    // NO COLON inside the value, deliberately - ioSender splits $I lines on every colon, so a
+    // "30.0:1234" here would parse as an extra field. Hence the dash.
+    strcpy(buf, "[NVSVER:");
+    strcat(buf, uitoa(SETTINGS_VERSION_MAJOR));
+    strcat(buf, ".");
+    strcat(buf, uitoa(SETTINGS_VERSION_MINOR));
+    strcat(buf, "-");
+    strcat(buf, uitoa(settings_layout_id()));
+    hal.stream.write(strcat(buf, "]" ASCII_EOL));
+
 #if COMPATIBILITY_LEVEL == 0
     extended = true;
 #endif

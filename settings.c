@@ -32,6 +32,7 @@
 #include "encoders.h"
 #include "machine_limits.h"
 #include "nvs_buffer.h"
+#include "task.h"           // task_run_on_startup, for the layout-mismatch warning in settings_init
 #include "tool_change.h"
 #include "state_machine.h"
 #include "strutils.h"
@@ -57,9 +58,58 @@ const settings_restore_t settings_all = {
     .driver_parameters = SETTINGS_RESTORE_DRIVER_PARAMETERS
 };
 
+/* In the configuration where NVS_ADDR_PARAMETERS is the FIXED 512 (see nvs.h), nothing relates that
+   address to sizeof(settings_t) - so a settings_t that grows past the gap silently writes over the
+   first coordinate system record, and the only symptom is corrupted work offsets. Make it a build
+   failure instead.
+
+   The other configuration derives the address from the size, so this is trivially true there; the
+   fixed case is the one that needed a guard. Measured when added, 3-axis: sizeof(settings_t) 420,
+   so 1 + 420 + 2 = 423 against 512, leaving 89 bytes spare. */
+_Static_assert(NVS_ADDR_GLOBAL + sizeof(settings_t) + NVS_CRC_BYTES <= NVS_ADDR_PARAMETERS,
+               "settings_t has outgrown the space before NVS_ADDR_PARAMETERS - it would overwrite "
+               "the first coordinate system record. Shrink it, or raise NVS_ADDR_PARAMETERS and "
+               "provide an NVS migration for the move.");
+
+/*! \brief The layout fingerprint.
+
+A multiplicative mix of the things that decide where records live and how long they are. It has to
+be a compile-time constant expression so the PROGMEM defaults below can carry it, which rules out a
+loop - hence the explicit terms rather than a hash function.
+
+What goes in, and why each term earns its place:
+
+ - sizeof(settings_t)          - the global record's own length, and in the >5-axis configuration
+                                 the base of NVS_ADDR_PARAMETERS, so it moves everything after it.
+ - sizeof(coord_system_data_t) - the record length AND the stride through the parameters area. This
+                                 is the term that catches the mismatch that started all of this:
+                                 ROTATION_ENABLE adds a field, so both change together.
+ - sizeof(stored_line_t)       - the startup-block and build-info record length.
+ - N_AXIS, N_CoordinateSystems, N_STARTUP_LINE - record counts; they size whole regions.
+ - NVS_CRC_BYTES               - sits between every record, so it shifts all of them.
+
+What is deliberately NOT in it: the firmware version. Including that would make every build a layout
+change, which is the coupling this work just removed.
+*/
+#define SETTINGS_LAYOUT_ID ( \
+      2166136261UL \
+    ^ ((uint32_t)sizeof(settings_t)             * 16777619UL) \
+    ^ ((uint32_t)sizeof(coord_system_data_t)    * 2246822519UL) \
+    ^ ((uint32_t)sizeof(stored_line_t)          * 3266489917UL) \
+    ^ ((uint32_t)N_AXIS                         * 668265263UL) \
+    ^ ((uint32_t)N_CoordinateSystems            * 374761393UL) \
+    ^ ((uint32_t)N_STARTUP_LINE                 * 2654435761UL) \
+    ^ ((uint32_t)NVS_CRC_BYTES                  * 1540483477UL) )
+
 PROGMEM static const settings_t defaults = {
 
-    .version.id = SETTINGS_VERSION,
+    .version.id = SETTINGS_VERSION_MAJOR,
+    .version_minor = SETTINGS_VERSION_MINOR,
+    // Little-endian, same order settings_layout_id_stored() reads back.
+    .layout_id = { (uint8_t)(SETTINGS_LAYOUT_ID),
+                   (uint8_t)(SETTINGS_LAYOUT_ID >> 8),
+                   (uint8_t)(SETTINGS_LAYOUT_ID >> 16),
+                   (uint8_t)(SETTINGS_LAYOUT_ID >> 24) },
     // version.build is no longer a firmware build date. It is kept only so an NVS image written by
     // the OLD scheme can still be recognised and migrated once - see the legacy pass in
     // settings_init(). A fresh image is written with 0, meaning "already in the current scheme".
@@ -2258,15 +2308,143 @@ FLASHMEM static void sanity_check (void)
     settings.control_disable_pullup.mask &= ~limits_override.mask;
 }
 
+FLASHMEM uint32_t settings_layout_id (void)
+{
+    return (uint32_t)SETTINGS_LAYOUT_ID;
+}
+
+FLASHMEM uint32_t settings_layout_id_stored (const settings_t *s)
+{
+    return (uint32_t)s->layout_id[0]
+         | ((uint32_t)s->layout_id[1] << 8)
+         | ((uint32_t)s->layout_id[2] << 16)
+         | ((uint32_t)s->layout_id[3] << 24);
+}
+
+FLASHMEM void settings_layout_id_set (settings_t *s)
+{
+    uint32_t id = (uint32_t)SETTINGS_LAYOUT_ID;
+
+    s->version.id     = SETTINGS_VERSION_MAJOR;
+    s->version_minor  = SETTINGS_VERSION_MINOR;
+    s->layout_id[0]   = (uint8_t)id;
+    s->layout_id[1]   = (uint8_t)(id >> 8);
+    s->layout_id[2]   = (uint8_t)(id >> 16);
+    s->layout_id[3]   = (uint8_t)(id >> 24);
+}
+
+/*! \brief Bring a stored image written by an older MAJOR up to the current one, in RAM.
+
+Each migrator leaves the image at the next major it knows how to produce, and the loop runs until
+the image reports the current one - so a later major adds one entry instead of touching the ones
+before it. `applies_up_to` is inclusive: an entry claims any stored major at or below it.
+*/
+typedef bool (*settings_migrate_ptr)(void);
+
+typedef struct {
+    uint8_t applies_up_to;
+    settings_migrate_ptr migrate;
+} settings_migration_t;
+
+/*! The legacy single-byte scheme, 23 and earlier, to 30.
+
+A restamp, not a relocation - and that is by construction, not luck. The 30 header fields were
+carved out of the former reserved[9] (see settings.h), so sizeof(settings_t) is identical in both
+schemes: the stored image is the same length, still validates against its own checksum, and every
+other NVS region is exactly where it was. Only the header needs filling in.
+
+version.build is left alone on purpose. It is the marker for the one-shot legacy field fixups in
+settings_init() below, and zeroing it here would skip them.
+*/
+FLASHMEM static bool migrate_legacy_to_30 (void)
+{
+    if(hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) != NVS_TransferResult_OK)
+        return false;
+
+    settings_layout_id_set(&settings);
+
+    return true;
+}
+
+PROGMEM static const settings_migration_t settings_migrations[] = {
+    { 29, migrate_legacy_to_30 }
+};
+
+//! True if the loaded image needed migrating, so settings_init() knows to persist it.
+static bool settings_migrated = false;
+
+//! True if an image of the CURRENT major was refused because its layout fingerprint differed.
+//! Kept apart from a plain read failure because the two mean different things to whoever is
+//! looking: a checksum failure is corruption, a fingerprint mismatch is the wrong binary.
+static bool settings_layout_mismatch = false;
+
+FLASHMEM static bool settings_migrate (uint8_t stored_major)
+{
+    uint_fast8_t guard = 0;
+
+    // Below the floor there is no format we know how to read, so refuse rather than guess at it.
+    if(stored_major < SETTINGS_VERSION_MIGRATABLE_MIN)
+        return false;
+
+    while(stored_major != SETTINGS_VERSION_MAJOR) {
+
+        uint_fast8_t idx;
+        const settings_migration_t *m = NULL;
+
+        for(idx = 0; idx < (sizeof(settings_migrations) / sizeof(settings_migrations[0])); idx++) {
+            if(stored_major <= settings_migrations[idx].applies_up_to) {
+                m = &settings_migrations[idx];
+                break;
+            }
+        }
+
+        // No path from here, or the migrator itself failed: refuse. The caller restores defaults
+        // and reports it rather than interpreting an image it cannot read.
+        if(m == NULL || !m->migrate())
+            return false;
+
+        // A migrator that does not advance the major would spin forever.
+        if(settings.version.id == stored_major || ++guard > (sizeof(settings_migrations) / sizeof(settings_migrations[0])) + 1)
+            return false;
+
+        stored_major = settings.version.id;
+    }
+
+    settings_migrated = true;
+
+    return true;
+}
+
 // Read global settings from persistent storage.
 // Checks version-byte of non-volatile storage and global settings copy.
 FLASHMEM bool read_global_settings (void)
 {
-    bool ok = hal.nvs.type != NVS_None && SETTINGS_VERSION == hal.nvs.get_byte(0) && hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK;
+    bool ok = false;
+
+    if(hal.nvs.type != NVS_None) {
+
+        uint8_t stored_major = hal.nvs.get_byte(0);
+
+        if(stored_major == SETTINGS_VERSION_MAJOR) {
+
+            ok = hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK
+                  && settings.version.id == SETTINGS_VERSION_MAJOR;
+
+            // Same major, but a layout this firmware does not lay out the same way: the records
+            // after this one are not where we would look for them. Refuse the image. A MINOR
+            // difference is fine by definition and is not checked.
+            if(ok && settings_layout_id_stored(&settings) != settings_layout_id()) {
+                settings_layout_mismatch = true;
+                ok = false;
+            }
+
+        } else
+            ok = settings_migrate(stored_major);
+    }
 
     sanity_check();
 
-    return ok && settings.version.id == SETTINGS_VERSION;
+    return ok;
 }
 
 // Write global settings to persistent storage
@@ -3672,6 +3850,14 @@ FLASHMEM void settings_init (void)
         if(hal.nvs.type != NVS_None)
             grbl.report.status_message(Status_SettingReadFail);
 
+        // Say WHICH of the two it was. A checksum failure means corruption; a fingerprint mismatch
+        // means the stored image is fine and this binary is the wrong one to read it - usually a
+        // compile option that moved a record. Without this the operator sees the same error:7 for
+        // both and has no way to tell a flash-gone-wrong from a settings loss.
+        if(settings_layout_mismatch)
+            task_run_on_startup(report_warning, "NVS layout differs from this firmware - settings were reset. "
+                                                "Check the build options against the one that wrote them.");
+
         settings_restore(settings); // Force restore all non-volatile storage data.
         report_init();
 #if COMPATIBILITY_LEVEL <= 1
@@ -3681,6 +3867,16 @@ FLASHMEM void settings_init (void)
 #endif
         changed.spindle = settings_changed_spindle();
     } else {
+
+        // A migrated image exists only in RAM until now. Persist it, and stamp byte 0, so the next
+        // boot takes the fast path instead of migrating again - and so a reader of byte 0 (the NVS
+        // RAM buffer's own gate, among others) sees the current major.
+        if(settings_migrated) {
+            settings_migrated = false;
+            if(hal.nvs.type != NVS_None)
+                hal.nvs.put_byte(0, SETTINGS_VERSION_MAJOR);
+            settings_write_global();
+        }
 
         report_init();
 
