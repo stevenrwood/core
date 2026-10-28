@@ -2331,18 +2331,176 @@ FLASHMEM void settings_layout_id_set (settings_t *s)
     s->layout_id[3]  = (uint8_t)(id >> 24);
 }
 
+/*! \brief TEMPORARY boot trace - C2 only, delete in C3.
+
+The first attempt at all of this bricked the controller and told us NOTHING: continuous reboot with
+no banner, no CrashReport, no watchdog line. The stream is actually up well before settings_init
+(driver_init installs it; the banner merely comes later), so a write from in here IS visible even
+when the boot never completes. That is the instrument that was missing.
+
+🔴 Guarded on the function pointer, because this codebase has already been bitten by exactly this:
+core commit 51f5daa6, "stream_select's print ran before hal.stream.write_all existed".
+*/
+FLASHMEM static void c2_trace (const char *what, uint32_t value)
+{
+    if(hal.stream.write == NULL)
+        return;
+
+    hal.stream.write("[MSG:C2 ");
+    hal.stream.write(what);
+    hal.stream.write("=");
+    hal.stream.write(uitoa(value));
+    hal.stream.write("]" ASCII_EOL);
+}
+
+/*! \brief Bring a stored image written by an older MAJOR up to the current one, IN RAM.
+
+Each migrator leaves the image at the next major it knows how to produce, and the loop runs until
+the image reports the current one - so a later major adds one entry instead of touching the ones
+before it. `applies_up_to` is inclusive: an entry claims any stored major at or below it.
+
+🔴 C2 persists NOTHING. The migrated image lives in RAM for this boot only, so every boot migrates
+again. That is deliberate for this increment - it means a failure here cannot have written anything,
+and reflashing recovers the machine with its settings intact. C3 adds the persist.
+*/
+typedef bool (*settings_migrate_ptr)(void);
+
+typedef struct {
+    uint8_t applies_up_to;
+    settings_migrate_ptr migrate;
+} settings_migration_t;
+
+/*! The legacy single-byte scheme, 23 and earlier, to 30.
+
+A restamp, not a relocation - and that is by construction, not luck. The 30 header fields were
+carved out of the former reserved[9] in C1, so sizeof(settings_t) is identical in both schemes: the
+stored image is the same length, still validates against its own checksum, and every other NVS
+region is exactly where it was. Only the header needs filling in.
+
+version.build is left alone on purpose. It is the marker for the one-shot legacy field fixups in
+settings_init() below, and zeroing it here would skip them.
+*/
+FLASHMEM static bool migrate_legacy_to_30 (void)
+{
+    bool ok = hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK;
+
+    c2_trace("mig.read", ok ? 1 : 0);
+
+    if(!ok)
+        return false;
+
+    settings.version.id = SETTINGS_VERSION_MAJOR;
+    settings_layout_id_set(&settings);
+
+    return true;
+}
+
+PROGMEM static const settings_migration_t settings_migrations[] = {
+    { 29, migrate_legacy_to_30 }
+};
+
+//! True if the loaded image needed migrating. C3 uses this to persist it; C2 only reports it.
+static bool settings_migrated = false;
+
+//! True if an image of the CURRENT major was refused because its layout fingerprint differed.
+//! Kept apart from a plain read failure because the two mean different things to whoever is
+//! looking: a checksum failure is corruption, a fingerprint mismatch is the wrong binary.
+static bool settings_layout_mismatch = false;
+
+FLASHMEM static bool settings_migrate (uint8_t stored_major)
+{
+    uint_fast8_t guard = 0;
+
+    c2_trace("mig.from", stored_major);
+
+    // Below the floor there is no format we know how to read, so refuse rather than guess at it.
+    if(stored_major < SETTINGS_VERSION_MIGRATABLE_MIN) {
+        c2_trace("mig.too-old", stored_major);
+        return false;
+    }
+
+    while(stored_major != SETTINGS_VERSION_MAJOR) {
+
+        uint_fast8_t idx;
+        const settings_migration_t *m = NULL;
+
+        for(idx = 0; idx < (sizeof(settings_migrations) / sizeof(settings_migrations[0])); idx++) {
+            if(stored_major <= settings_migrations[idx].applies_up_to) {
+                m = &settings_migrations[idx];
+                break;
+            }
+        }
+
+        // No path from here, or the migrator itself failed: refuse. The caller restores defaults
+        // and reports it rather than interpreting an image it cannot read.
+        if(m == NULL) {
+            c2_trace("mig.no-path", stored_major);
+            return false;
+        }
+
+        c2_trace("mig.call", stored_major);
+
+        if(!m->migrate())
+            return false;
+
+        // A migrator that does not advance the major would spin forever.
+        if(settings.version.id == stored_major || ++guard > (sizeof(settings_migrations) / sizeof(settings_migrations[0])) + 1) {
+            c2_trace("mig.stuck", settings.version.id);
+            return false;
+        }
+
+        stored_major = settings.version.id;
+    }
+
+    settings_migrated = true;
+
+    c2_trace("mig.done", stored_major);
+
+    return true;
+}
+
 // Read global settings from persistent storage.
 // Checks version-byte of non-volatile storage and global settings copy.
-//
-// 🔴 C1 of 3: UNCHANGED on purpose. The reworked version with the migration chain is C2, and it is
-// the prime suspect for the 2026-10-28 brick - so it goes in on its own, instrumented.
 FLASHMEM bool read_global_settings (void)
 {
-    bool ok = hal.nvs.type != NVS_None && SETTINGS_VERSION == hal.nvs.get_byte(0) && hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK;
+    bool ok = false;
+
+    c2_trace("rgs.enter", hal.nvs.type);
+
+    if(hal.nvs.type != NVS_None) {
+
+        uint8_t stored_major = hal.nvs.get_byte(0);
+
+        c2_trace("rgs.byte0", stored_major);
+
+        if(stored_major == SETTINGS_VERSION_MAJOR) {
+
+            ok = hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK
+                  && settings.version.id == SETTINGS_VERSION_MAJOR;
+
+            c2_trace("rgs.read", ok ? 1 : 0);
+
+            // Same major, but a layout this firmware does not lay out the same way: the records
+            // after this one are not where we would look for them. Refuse the image. A MINOR
+            // difference is fine by definition and is not checked.
+            if(ok && settings_layout_id_stored(&settings) != settings_layout_id()) {
+                c2_trace("rgs.layout-stored", settings_layout_id_stored(&settings));
+                c2_trace("rgs.layout-want", settings_layout_id());
+                settings_layout_mismatch = true;
+                ok = false;
+            }
+
+        } else
+            ok = settings_migrate(stored_major);
+    }
 
     sanity_check();
 
-    return ok && settings.version.id == SETTINGS_VERSION;
+    c2_trace("rgs.ret", ok ? 1 : 0);
+    c2_trace("rgs.migrated", settings_migrated ? 1 : 0);
+    c2_trace("rgs.mismatch", settings_layout_mismatch ? 1 : 0);
+
+    return ok;
 }
 
 // Write global settings to persistent storage

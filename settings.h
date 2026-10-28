@@ -35,17 +35,26 @@ Byte 0 of non-volatile storage holds the version of the STORAGE FORMAT - not the
 which is derived from a git tag (see grbl.h) and changes on every commit. Keying migration on that
 would rewrite all of NVS on every flash.
 
-🔴 **C1 of 3: SETTINGS_VERSION IS DELIBERATELY STILL 23.** The major/minor scheme, the gate changes
-and the migration chain are C2. C1 only adds the fields, the computed fingerprint and its report, so
-that nothing in the boot path changes behaviour. Doing all of it at once bricked the controller on
-2026-10-28 - continuous reboot with no output at all - so it goes back in increments that can each
-be flashed and judged separately.
+MAJOR is 30, deliberately above the legacy scheme's last value of 23, so a stored byte below 30 is
+unambiguously the old single-byte scheme - 24..29 are left clear for any upstream increment. MINOR
+means a compatible revision within a major: readable by any firmware of the same major.
 
-MINOR means a compatible revision within a major: readable by any firmware of the same major.
+🔴 **C2 of 3.** C1 added the fields and the computed fingerprint, inert. C2 flips the major and adds
+the gate change plus the migration chain - **migrating in RAM ONLY, persisting nothing.** That is
+the safety property that makes this step reversible: a C2 that fails cannot have damaged NVS, so
+reflashing C1 or the recovery hex gets the machine back with settings intact. C3 adds the persist.
+
+SETTINGS_VERSION is kept as an alias because the two gates outside this header (read_global_settings
+in settings.c, and nvs_buffer_init) compare against it by that name.
 */
 ///@{
-#define SETTINGS_VERSION 23  // NOTE: Check settings_reset() when moving to next version.
+#define SETTINGS_VERSION_MAJOR 30
 #define SETTINGS_VERSION_MINOR 0
+#define SETTINGS_VERSION SETTINGS_VERSION_MAJOR // NOTE: Check settings_reset() when moving to next version.
+//! Stored majors in [SETTINGS_VERSION_MIGRATABLE_MIN, SETTINGS_VERSION_MAJOR) are offered to the
+//! migration chain instead of being discarded. Below the floor there is no known format to migrate
+//! FROM, so such an image is treated as foreign and the settings are restored to defaults.
+#define SETTINGS_VERSION_MIGRATABLE_MIN 20
 ///@}
 
 // Define axis settings numbering scheme. Starts at Setting_AxisSettingsBase, every INCREMENT, over N_SETTINGS.
