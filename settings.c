@@ -32,6 +32,7 @@
 #include "encoders.h"
 #include "machine_limits.h"
 #include "nvs_buffer.h"
+#include "task.h"           // task_run_on_startup, for the layout-mismatch warning in settings_init
 #include "tool_change.h"
 #include "state_machine.h"
 #include "strutils.h"
@@ -3871,6 +3872,17 @@ FLASHMEM void settings_init (void)
         if(hal.nvs.type != NVS_None)
             grbl.report.status_message(Status_SettingReadFail);
 
+        // Say WHICH of the two it was. A checksum failure means corruption; a fingerprint mismatch
+        // means the stored image is fine and this binary is the wrong one to read it - usually a
+        // compile option that moved a record. Without this the operator sees the same error:7 for
+        // both and cannot tell a bad flash from a settings loss.
+        //
+        // report_warning deliberately: it is the only startup task kind that survives
+        // task_execute_on_startup()'s purge, so this still gets through in a degraded boot.
+        if(settings_layout_mismatch)
+            task_run_on_startup(report_warning, "NVS layout differs from this firmware - settings were reset. "
+                                                "Check the build options against the one that wrote them.");
+
         settings_restore(settings); // Force restore all non-volatile storage data.
         report_init();
 #if COMPATIBILITY_LEVEL <= 1
@@ -3880,6 +3892,20 @@ FLASHMEM void settings_init (void)
 #endif
         changed.spindle = settings_changed_spindle();
     } else {
+
+        // C3: persist a migrated image. Until now the migration lived in RAM for the current boot
+        // only, so every boot re-migrated. Writing byte 0 and the struct once means the next boot
+        // takes the fast path, and anything that reads byte 0 directly - nvs_buffer_init's own gate
+        // among them - sees the current major.
+        //
+        // Safe here: settings_restore() in the failure branch above already writes at this point in
+        // init, so this is not a new class of operation.
+        if(settings_migrated) {
+            settings_migrated = false;
+            if(hal.nvs.type != NVS_None)
+                hal.nvs.put_byte(0, SETTINGS_VERSION_MAJOR);
+            settings_write_global();
+        }
 
         report_init();
 

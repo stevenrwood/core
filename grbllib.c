@@ -78,37 +78,21 @@ static driver_startup_t driver = { .ok = 0xFF };
 static settings_changed_ptr hal_settings_changed;
 static stepper_enable_ptr stepper_enable;
 
-/* ---- TEMPORARY DIAGNOSTIC, 2026-10-28. Remove once the C2 NVS failure is understood. ----
+/* NOTE on diagnosing a driver.ok / Alarm_SelftestFailed (ALARM:16) failure, should it recur.
  *
- * `driver` starts as all-ones, so every assignment below can only CLEAR a bit, and a single cleared
- * bit trips Alarm_SelftestFailed (ALARM:16) at the check further down. This records the FAILED mask
- * - (uint8_t)~driver.ok, so 0 means healthy and the bits read directly:
+ * `driver` starts as all-ones, so every assignment below can only CLEAR a bit, and one cleared bit
+ * trips the alarm at the check further down. A temporary trace of (uint8_t)~driver.ok - the FAILED
+ * mask, where 1=init 2=setup 4=spindle 8=amass 16=pulse_delay - at each assignment site is what
+ * found the 2026-10-28 fault (the driver's hard-coded settings version). Two constraints if it is
+ * ever reinstated:
  *
- *     1 = init    2 = setup    4 = spindle    8 = amass    16 = pulse_delay
- *
- * RECORD EARLY, PRINT LATE - and both halves are forced by things measured today:
- *
- *  - Writing to hal.stream before the banner (grbl_enter, further down) HANGS THE BOOT: _usb_write
+ *  - RECORD EARLY, PRINT LATE. Writing to hal.stream from the init path HANGS THE BOOT: _usb_write
  *    spins until a host drains the port, and the watchdog then resets the board every 10s with the
- *    output still stuck in the buffer. So nothing may be printed from the init path itself.
- *  - task_execute_on_startup() PURGES every queued startup task except report_warning when
- *    sys.driver_started is false - which is exactly the state being diagnosed. That is why
- *    report_driver_error's own "Fatal: Incompatible driver" message never appeared, and why this
- *    trace is queued as a report_warning: it is the only kind that survives.
+ *    output still stuck in the buffer.
+ *  - Queue it as a report_warning. task_execute_on_startup() purges every startup task EXCEPT
+ *    report_warning when sys.driver_started is false - which is exactly the state being diagnosed,
+ *    and is why report_driver_error's own "Fatal: Incompatible driver" message never appeared.
  */
-#define DRVOK_TRACE_MAX 8
-static struct { uint8_t site, fail; } drvok_trace[DRVOK_TRACE_MAX];
-static uint_fast8_t drvok_n = 0;
-static char drvok_msg[128];
-
-static void drvok_sample (uint8_t site)
-{
-    if(drvok_n < DRVOK_TRACE_MAX) {
-        drvok_trace[drvok_n].site = site;
-        drvok_trace[drvok_n].fail = (uint8_t)~driver.ok;
-        drvok_n++;
-    }
-}
 DCRAM static struct {
     volatile core_task_t *immediate;     //!< Pointer to first entry of linked list of tasks to run immediately.
     volatile core_task_t *delayed;       //!< Pointer to first entry of linked list of delayed tasks to run, in execution order.
@@ -338,7 +322,6 @@ FLASHMEM int grbl_enter (void)
 #endif
 
     driver.init = driver_init();
-    drvok_sample(1);                            // after driver_init()
 
 #if NVSDATA_BUFFER_ENABLE
     nvs_buffer_alloc(); // Allocate memory block for NVS buffer
@@ -399,12 +382,10 @@ FLASHMEM int grbl_enter (void)
 #else
     hal.driver_cap.amass_level = 0;
 #endif
-    drvok_sample(2);                            // after the amass block
 
 #ifdef DEFAULT_STEP_PULSE_DELAY
     driver.pulse_delay = hal.driver_cap.step_pulse_delay;
 #endif
-    drvok_sample(3);                            // after the pulse_delay block
 /*
 #if AXIS_N_SETTINGS > 4
     driver_ok = driver_ok & hal.driver_cap.axes >= AXIS_N_SETTINGS;
@@ -414,8 +395,6 @@ FLASHMEM int grbl_enter (void)
 
     // 🔑 Note the gate: driver_setup is only called when driver.ok is ALREADY 0xFF, so an earlier
     // failing bit short-circuits it and `setup` then stays set while never having been tested.
-    drvok_sample(4);                            // at the driver_setup gate
-
     if((sys.ioinit_pending = driver.ok == 0xFF)) {
 
         hal_settings_changed = hal.settings_changed;
@@ -425,8 +404,6 @@ FLASHMEM int grbl_enter (void)
 
         sys.ioinit_pending = false;
     }
-
-    drvok_sample(5);                            // after driver_setup (or after it was skipped)
 
     spindle_id_t spindle_id, encoder_spindle;
 
@@ -449,29 +426,8 @@ FLASHMEM int grbl_enter (void)
     } else
         driver.spindle = spindle_select(spindle_add_null());
 
-    drvok_sample(6);                            // after the spindle selection chain
-
     if(!hal.driver_cap.sd_card)
         settings.macro_atc_flags.error_on_no_macro = Off;
-
-    drvok_sample(7);                            // at the self-test check itself
-
-    // Format the whole trace and queue it as a report_warning - the only task kind that survives
-    // task_execute_on_startup()'s purge when sys.driver_started is false. Queued unconditionally so
-    // a healthy build prints an all-zero baseline for comparison.
-    {
-        uint_fast8_t i;
-
-        strcpy(drvok_msg, "drvok fail@site");
-        for(i = 0; i < drvok_n; i++) {
-            strcat(drvok_msg, " ");
-            strcat(drvok_msg, uitoa(drvok_trace[i].site));
-            strcat(drvok_msg, "=");
-            strcat(drvok_msg, uitoa(drvok_trace[i].fail));
-        }
-        strcat(drvok_msg, " (1=init 2=setup 4=spindle 8=amass 16=pulse_delay)");
-        task_run_on_startup(report_warning, drvok_msg);
-    }
 
     if(driver.ok != 0xFF) {
         sys.alarm = Alarm_SelftestFailed;
