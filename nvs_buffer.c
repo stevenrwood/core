@@ -284,20 +284,13 @@ FLASHMEM bool nvs_buffer_init (void)
         // If it cannot migrate after all, it returns false and settings_init() restores defaults
         // and reports - the same outcome as before, just arrived at by the code that knows.
         //
-        // The trace is TEMPORARY, C2 only, and guarded on the function pointer: core commit
-        // 51f5daa6 is this codebase crashing on a debug print issued before the stream existed.
-        if(hal.stream.write) {
-            hal.stream.write("[MSG:C2 nvsbuf.byte0=");
-            hal.stream.write(uitoa(ram_get_byte(0)));
-            hal.stream.write("]" ASCII_EOL);
-        }
-
+        // 🔴 DO NOT ADD A TRACE HERE. One was tried and it hung the boot: _usb_write
+        // (usb_serial_ard.cpp:251) spins until hal.stream_blocking_callback() releases it, and no
+        // USB host has opened the port this early, so the write never completes. Record to retained
+        // memory and print after the banner if an early trace is ever needed.
         if(physical_nvs.type == NVS_None ||
             !(ram_get_byte(0) == SETTINGS_VERSION_MAJOR ||
               (ram_get_byte(0) >= SETTINGS_VERSION_MIGRATABLE_MIN && ram_get_byte(0) < SETTINGS_VERSION_MAJOR))) {
-
-            if(hal.stream.write)
-                hal.stream.write("[MSG:C2 nvsbuf.restoring-defaults]" ASCII_EOL);
 
             settings_restore(settings_all);
             if(physical_nvs.type == NVS_Flash)

@@ -2331,27 +2331,20 @@ FLASHMEM void settings_layout_id_set (settings_t *s)
     s->layout_id[3]  = (uint8_t)(id >> 24);
 }
 
-/*! \brief TEMPORARY boot trace - C2 only, delete in C3.
-
-The first attempt at all of this bricked the controller and told us NOTHING: continuous reboot with
-no banner, no CrashReport, no watchdog line. The stream is actually up well before settings_init
-(driver_init installs it; the banner merely comes later), so a write from in here IS visible even
-when the boot never completes. That is the instrument that was missing.
-
-🔴 Guarded on the function pointer, because this codebase has already been bitten by exactly this:
-core commit 51f5daa6, "stream_select's print ran before hal.stream.write_all existed".
-*/
-FLASHMEM static void c2_trace (const char *what, uint32_t value)
-{
-    if(hal.stream.write == NULL)
-        return;
-
-    hal.stream.write("[MSG:C2 ");
-    hal.stream.write(what);
-    hal.stream.write("=");
-    hal.stream.write(uitoa(value));
-    hal.stream.write("]" ASCII_EOL);
-}
+/* 🔴 DO NOT WRITE TO hal.stream FROM ANYWHERE IN THIS FILE'S INIT PATH.
+ *
+ * A boot trace was added here and it HUNG THE CONTROLLER - reboot loop, no output. _usb_write()
+ * (usb_serial_ard.cpp:251) spins `while(txbuf.length)` and only escapes when
+ * hal.stream_blocking_callback() returns false. During nvs_buffer_init/settings_init no USB host has
+ * opened the port, so availableForWrite() never clears, the callback keeps saying "keep waiting",
+ * and the boot never progresses - the watchdog then resets the board, forever, before anything is
+ * ever printed.
+ *
+ * So the obvious instrument is unusable here: the stream exists, but writing to it before a host
+ * attaches is fatal. Anything needing an early trace must record to retained memory and print it
+ * AFTER the banner, where a host is listening. (Related precedent: core 51f5daa6, a debug print
+ * issued before the stream was ready.)
+ */
 
 /*! \brief Bring a stored image written by an older MAJOR up to the current one, IN RAM.
 
@@ -2382,11 +2375,7 @@ settings_init() below, and zeroing it here would skip them.
 */
 FLASHMEM static bool migrate_legacy_to_30 (void)
 {
-    bool ok = hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK;
-
-    c2_trace("mig.read", ok ? 1 : 0);
-
-    if(!ok)
+    if(hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) != NVS_TransferResult_OK)
         return false;
 
     settings.version.id = SETTINGS_VERSION_MAJOR;
@@ -2411,13 +2400,9 @@ FLASHMEM static bool settings_migrate (uint8_t stored_major)
 {
     uint_fast8_t guard = 0;
 
-    c2_trace("mig.from", stored_major);
-
     // Below the floor there is no format we know how to read, so refuse rather than guess at it.
-    if(stored_major < SETTINGS_VERSION_MIGRATABLE_MIN) {
-        c2_trace("mig.too-old", stored_major);
+    if(stored_major < SETTINGS_VERSION_MIGRATABLE_MIN)
         return false;
-    }
 
     while(stored_major != SETTINGS_VERSION_MAJOR) {
 
@@ -2433,28 +2418,20 @@ FLASHMEM static bool settings_migrate (uint8_t stored_major)
 
         // No path from here, or the migrator itself failed: refuse. The caller restores defaults
         // and reports it rather than interpreting an image it cannot read.
-        if(m == NULL) {
-            c2_trace("mig.no-path", stored_major);
+        if(m == NULL)
             return false;
-        }
-
-        c2_trace("mig.call", stored_major);
 
         if(!m->migrate())
             return false;
 
         // A migrator that does not advance the major would spin forever.
-        if(settings.version.id == stored_major || ++guard > (sizeof(settings_migrations) / sizeof(settings_migrations[0])) + 1) {
-            c2_trace("mig.stuck", settings.version.id);
+        if(settings.version.id == stored_major || ++guard > (sizeof(settings_migrations) / sizeof(settings_migrations[0])) + 1)
             return false;
-        }
 
         stored_major = settings.version.id;
     }
 
     settings_migrated = true;
-
-    c2_trace("mig.done", stored_major);
 
     return true;
 }
@@ -2465,27 +2442,19 @@ FLASHMEM bool read_global_settings (void)
 {
     bool ok = false;
 
-    c2_trace("rgs.enter", hal.nvs.type);
-
     if(hal.nvs.type != NVS_None) {
 
         uint8_t stored_major = hal.nvs.get_byte(0);
-
-        c2_trace("rgs.byte0", stored_major);
 
         if(stored_major == SETTINGS_VERSION_MAJOR) {
 
             ok = hal.nvs.memcpy_from_nvs((uint8_t *)&settings, NVS_ADDR_GLOBAL, sizeof(settings_t), true) == NVS_TransferResult_OK
                   && settings.version.id == SETTINGS_VERSION_MAJOR;
 
-            c2_trace("rgs.read", ok ? 1 : 0);
-
             // Same major, but a layout this firmware does not lay out the same way: the records
             // after this one are not where we would look for them. Refuse the image. A MINOR
             // difference is fine by definition and is not checked.
             if(ok && settings_layout_id_stored(&settings) != settings_layout_id()) {
-                c2_trace("rgs.layout-stored", settings_layout_id_stored(&settings));
-                c2_trace("rgs.layout-want", settings_layout_id());
                 settings_layout_mismatch = true;
                 ok = false;
             }
@@ -2495,10 +2464,6 @@ FLASHMEM bool read_global_settings (void)
     }
 
     sanity_check();
-
-    c2_trace("rgs.ret", ok ? 1 : 0);
-    c2_trace("rgs.migrated", settings_migrated ? 1 : 0);
-    c2_trace("rgs.mismatch", settings_layout_mismatch ? 1 : 0);
 
     return ok;
 }
