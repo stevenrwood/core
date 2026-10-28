@@ -84,11 +84,6 @@ __NOTE:__ 1024 bytes of persistent storage is the minimum required.
 #endif
 ///@}
 
-/* NOTE: the guard asserting that settings_t still fits below NVS_ADDR_PARAMETERS lives in
-   settings.c, not here. This header is included in many places that have not declared settings_t -
-   the macros above only expand at their use sites, inside functions - so a file-scope assertion
-   here does not compile. */
-
 typedef enum {
     NVS_None = 0,   //!< 0
     NVS_EEPROM,     //!< 1

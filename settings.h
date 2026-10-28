@@ -29,31 +29,8 @@
 #include "stream.h"
 #include "plugins.h"
 
-/*! @name NVS layout versioning.
-
-Byte 0 of non-volatile storage holds the MAJOR. It is deliberately 30, above the legacy scheme's
-last value of 23, so a stored byte below 30 is unambiguously the old single-byte scheme - 24..29 are
-left clear for any upstream increment.
-
-This is the version of the STORAGE FORMAT and nothing else. It is not the firmware version: that is
-derived from a git tag (see grbl.h) and changes on every commit, so keying migration on it would
-rewrite all of NVS on every flash.
-
-MAJOR means "a firmware that does not know this number cannot read this image". MINOR means a
-compatible revision within a major - readable by any firmware of the same major.
-
-SETTINGS_VERSION is kept as an alias because the two gates outside this header (read_global_settings
-here, and nvs_buffer_init) compare against it by that name.
-*/
-///@{
-#define SETTINGS_VERSION_MAJOR 30
-#define SETTINGS_VERSION_MINOR 0
-#define SETTINGS_VERSION SETTINGS_VERSION_MAJOR // NOTE: Check settings_reset() when moving to next version.
-//! Stored majors in [SETTINGS_VERSION_MIGRATABLE_MIN, SETTINGS_VERSION_MAJOR) are offered to the
-//! migration chain instead of being discarded. Below the floor there is no known format to migrate
-//! FROM, so such an image is treated as foreign and the settings are restored to defaults.
-#define SETTINGS_VERSION_MIGRATABLE_MIN 20
-///@}
+// Version of the persistent storage data. Always stored in byte 0 of non-volatile storage.
+#define SETTINGS_VERSION 23  // NOTE: Check settings_reset() when moving to next version.
 
 // Define axis settings numbering scheme. Starts at Setting_AxisSettingsBase, every INCREMENT, over N_SETTINGS.
 #define AXIS_SETTINGS_INCREMENT  10 // Must be greater than the number of axis settings.
@@ -943,22 +920,7 @@ typedef struct {
     uint16_t stepper_enable_delay; // Move to stepper_settings_t
     tool_id_t tool_id;
     serial_format_t modbus_stream_format; // TODO: remove in next version
-    /* NVS layout versioning, 2026-10-28. Carved OUT OF the former reserved[9] rather than appended,
-       so sizeof(settings_t) is UNCHANGED - which is the whole point. In the >5-axis configuration
-       NVS_ADDR_PARAMETERS is DERIVED from sizeof(settings_t) (see nvs.h), so growing this struct
-       relocates every stored coordinate record, the startup block, the build info and the tool
-       table. That is the same class of silent corruption this versioning exists to detect.
-
-       Byte-wide types deliberately: a uint16_t/uint32_t here would carry an alignment requirement
-       and could change the struct size through padding. char and uint8_t have alignment 1, so nine
-       bytes are replaced by nine bytes and the size cannot move. It also means a legacy (v23) image
-       is the same length as a current one, so it still validates against its own stored checksum -
-       which is what makes the legacy migrator a restamp rather than a relocation.
-
-       layout_id is little-endian; use settings_layout_id() / settings_layout_id_set(). */
-    uint8_t version_minor;        // = SETTINGS_VERSION_MINOR
-    uint8_t layout_id[4];         // = SETTINGS_LAYOUT_ID, computed - see settings.c
-    char reserved[4];             // Reserved For future expansion
+    char reserved[9];             // Reserved For future expansion
 } settings_t;
 
 typedef enum {
@@ -1145,22 +1107,6 @@ typedef struct setting_details {
 typedef setting_details_t *(*on_get_settings_ptr)(void);
 
 extern settings_t settings;
-
-/*! \brief The computed layout fingerprint this firmware expects.
-
-Hashes the sizes of the versioned records and the compile options that move them. It catches a
-layout change whether or not anyone remembered to bump a version - which is the case that actually
-bit: two builds of one core tip, same SETTINGS_VERSION, same firmware, different ROTATION_ENABLE,
-and therefore a different coord_system_data_t size AND a different stride through the parameters
-area. No declared number can catch that, because nobody edits a struct to change a compile option.
-*/
-uint32_t settings_layout_id (void);
-
-//! Read the stored fingerprint out of a settings image (layout_id is a little-endian byte array).
-uint32_t settings_layout_id_stored (const settings_t *s);
-
-//! Stamp this firmware's fingerprint and minor version into a settings image.
-void settings_layout_id_set (settings_t *s);
 
 // Initialize the configuration subsystem (load settings from persistent storage)
 void settings_init();
